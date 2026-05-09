@@ -31,10 +31,10 @@ Requires Node.js 18 or newer.
 npm install -g github:Lexaplus/cogx
 ```
 
-**From npm** (once published):
+**From npm:**
 
 ```bash
-npm install -g cogx
+npm install -g @cognitivx/cli
 ```
 
 **One-off** without installing globally:

@@ -1,4 +1,4 @@
-node_modules/
-*.tgz
 .DS_Store
 .npmrc
+*.tgz
+node_modules/
