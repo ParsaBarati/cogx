@@ -25,11 +25,25 @@ iCog is a persistent cross-session memory layer. The `cogx` CLI gives you (and y
 
 Requires Node.js 18 or newer.
 
+**From GitHub** (works today, no npm publish needed):
+
+```bash
+npm install -g github:Lexaplus/cogx
+```
+
+**From npm** (once published):
+
 ```bash
 npm install -g cogx
 ```
 
-Verify:
+**One-off** without installing globally:
+
+```bash
+npx github:Lexaplus/cogx talk "what did we ship today"
+```
+
+Verify the install:
 
 ```bash
 cogx --version
