@@ -1,0 +1,48 @@
+{
+  "name": "cogx",
+  "version": "1.0.0",
+  "description": "iCog CLI — recall, remember, and talk to your personal AI from any terminal. Pure Node.js, zero dependencies.",
+  "bin": {
+    "cogx": "./index.js"
+  },
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "icog",
+    "cognitivx",
+    "memory",
+    "ai",
+    "mcp",
+    "claude",
+    "agent",
+    "cli"
+  ],
+  "author": {
+    "name": "CognitiveX",
+    "email": "support@cognitivx.io",
+    "url": "https://i.cognitivx.io"
+  },
+  "license": "MIT",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "homepage": "https://i.cognitivx.io/install",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Lexaplus/cogx.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Lexaplus/cogx/issues"
+  }
+}
