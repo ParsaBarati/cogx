@@ -169,6 +169,119 @@ async function httpRequest(method, route, { body, auth = true, timeoutMs = DEFAU
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---------------------------------------------------------------------------
+// SSE streaming
+// ---------------------------------------------------------------------------
+
+// Consume a Server-Sent-Events stream. Calls onEvent({event, data}) for each
+// dispatched message. Resolves when the stream ends. No retries — deep
+// recall/remember is interactive and a failure should surface immediately.
+async function httpStream(method, route, { body, onEvent, timeoutMs = 120000 } = {}) {
+  const url = API_URL + route;
+  const headers = {
+    "Content-Type": "application/json",
+    "Accept": "text/event-stream",
+    "User-Agent": `cogx/${VERSION}`,
+    "X-API-Key": getApiKey(),
+  };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let r;
+  try {
+    r = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined, signal: controller.signal });
+  } catch (e) {
+    clearTimeout(timer);
+    throw e;
+  }
+  if (!r.ok) {
+    clearTimeout(timer);
+    const text = await r.text().catch(() => "");
+    throw new Error(`HTTP ${r.status} ${r.statusText}${text ? ": " + text.slice(0, 300) : ""}`);
+  }
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let evName = "message";
+  let dataLines = [];
+  const dispatch = () => {
+    if (!dataLines.length) { evName = "message"; return; }
+    const data = dataLines.join("\n");
+    try { onEvent({ event: evName, data: JSON.parse(data) }); }
+    catch { onEvent({ event: evName, data }); }
+    evName = "message";
+    dataLines = [];
+  };
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, idx).replace(/\r$/, "");
+        buf = buf.slice(idx + 1);
+        if (line === "") { dispatch(); continue; }
+        if (line.startsWith(":")) continue;
+        const sep = line.indexOf(":");
+        const field = sep < 0 ? line : line.slice(0, sep);
+        const val = sep < 0 ? "" : line.slice(sep + 1).replace(/^ /, "");
+        if (field === "event") evName = val;
+        else if (field === "data") dataLines.push(val);
+      }
+    }
+    dispatch();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Render a single deep-memory event to the terminal as one line in a
+// vertical chain. Indentation + glyphs match the on-brand style used by the
+// chat UI's DeepMemoryChain component.
+function renderChainEvent(ev) {
+  const k = ev.kind;
+  if (k === "start") {
+    console.log(c.mag("⌁") + " " + c.bold("deep memory"));
+    console.log(c.gray("│"));
+    return;
+  }
+  if (k === "plan") {
+    const qs = (ev.queries || []).map((q) => `"${q}"`).join(", ");
+    console.log(c.mag("◇") + " " + c.bold("plan") + c.gray("  " + qs));
+    console.log(c.gray("│"));
+    return;
+  }
+  if (k === "search") {
+    const q = (ev.query || "").slice(0, 80);
+    const hits = ev.hits != null ? `  ${c.dim(ev.hits + " hits")}` : "";
+    console.log(c.cyan("◯") + ` ${c.gray("search")}  "${q}"${hits}`);
+    console.log(c.gray("│"));
+    return;
+  }
+  if (k === "reflect") {
+    const arrow = ev.action === "continue" ? c.yellow("↻") : c.green("✓");
+    const label = ev.action === "continue" ? "another angle" : "coverage sufficient";
+    console.log(`${arrow} ${c.gray("reflect")}  ${c.dim(label + (ev.reason ? " — " + ev.reason : ""))}`);
+    console.log(c.gray("│"));
+    return;
+  }
+  if (k === "synthesize") {
+    console.log(c.mag("✦") + " " + c.gray("synthesize") + c.dim("  " + (ev.candidates || 0) + " candidates"));
+    console.log(c.gray("│"));
+    return;
+  }
+  if (k === "classify") {
+    const label = { write_new: "new memory", skip_duplicate: "duplicate found", refine: "refinement" }[ev.action] || ev.action;
+    console.log(c.mag("✦") + " " + c.gray("classify") + "  " + c.bold(label) + (ev.reason ? c.dim("  — " + ev.reason) : ""));
+    console.log(c.gray("│"));
+    return;
+  }
+  if (k === "done") {
+    console.log(c.green("●") + " " + c.gray("done"));
+    return;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Browser open
 // ---------------------------------------------------------------------------
 
@@ -370,8 +483,40 @@ async function cmdRecall(args, flags) {
 
   query = tagWithProject(query, flags.project);
   const limit = parseInt(flags.limit || "8", 10);
-  const payload = { query, limit };
+  const deep = !!flags.deep;
+  const payload = { query, limit, deep };
   if (flags.type) payload.memory_type = flags.type;
+
+  if (deep) {
+    const events = [];
+    let final = null;
+    await httpStream("POST", "/api/consciousness/recall", {
+      body: payload,
+      onEvent: ({ data }) => {
+        if (!data || typeof data !== "object") return;
+        events.push(data);
+        if (!JSON_MODE) renderChainEvent(data);
+        if (data.kind === "done") final = data;
+      },
+    });
+    final = final || {};
+    const memories = final.memories || [];
+    if (JSON_MODE) { console.log(JSON.stringify({ ok: true, query, deep: true, events, memories, summary: final.summary || "" })); return; }
+    console.log("");
+    if (final.summary) console.log(c.dim("Summary: ") + final.summary + "\n");
+    console.log(c.dim(`Searched ${final.total_searched || 0} memories across ${final.turns || 0} turn(s).\n`));
+    if (!memories.length) { console.log(c.dim("No relevant memories found.")); return; }
+    for (let i = 0; i < memories.length; i++) {
+      const m = memories[i];
+      const mtype = m.memory_type || "?";
+      const sim = m.similarity != null ? ` ${c.dim(`sim=${m.similarity.toFixed(2)}`)}` : "";
+      console.log(`${c.cyan(`${i + 1}.`)} ${c.gray(`[${mtype}]`)}${sim}`);
+      console.log(`   ${m.text || ""}`);
+      console.log(c.dim(`   id: ${m.id}`));
+      console.log("");
+    }
+    return;
+  }
 
   const result = await httpRequest("POST", "/api/consciousness/recall", { body: payload });
   const memories = result.memories || [];
@@ -398,6 +543,36 @@ async function cmdRemember(args, flags) {
 
   content = tagWithProject(content, flags.project);
   const memType = flags.type || "semantic";
+  const deep = !!flags.deep;
+
+  if (deep) {
+    const events = [];
+    let final = null;
+    await httpStream("POST", "/api/consciousness/remember", {
+      body: { content, memory_type: memType, deep: true },
+      onEvent: ({ data }) => {
+        if (!data || typeof data !== "object") return;
+        events.push(data);
+        if (!JSON_MODE) renderChainEvent(data);
+        if (data.kind === "done") final = data;
+      },
+    });
+    final = final || {};
+    if (JSON_MODE) { console.log(JSON.stringify({ ok: true, deep: true, ...final, events })); return; }
+    console.log("");
+    const id = final.memory_id || "";
+    if (final.action === "skip_duplicate") {
+      console.log(c.yellow("⤬") + ` skipped — duplicate of ${id.slice(0, 8)} ${c.dim(final.reason || "")}`);
+    } else if (final.action === "refine") {
+      console.log(c.green("✓") + ` refinement stored (${id.slice(0, 8)}) related to ${(final.target_id || "?").slice(0, 8)}`);
+    } else if (final.action === "error") {
+      console.log(c.red("✗") + " failed to store memory");
+    } else {
+      console.log(c.green("✓") + ` remembered (${id.slice(0, 8)}) [${memType}]`);
+    }
+    return;
+  }
+
   const result = await httpRequest("POST", "/api/consciousness/remember", { body: { content, memory_type: memType } });
   const id = result.memory_id || result.id || "";
   out(
@@ -694,23 +869,30 @@ List agents that have iCog MCP installed.`,
 
 Remove iCog from an agent's MCP config (leaves other servers intact).`,
 
-  "recall": `cogx recall <query> [--type TYPE] [--limit N] [--project NAME] [--json]
+  "recall": `cogx recall <query> [--type TYPE] [--limit N] [--project NAME] [--deep] [--json]
 
 Semantic search across your memories. Accepts piped stdin.
 
 Types:   semantic | episodic | procedural | foundational
-Project: prepends "[Project: NAME] " to the query`,
+Project: prepends "[Project: NAME] " to the query
+--deep:  adaptive multi-step recall — plans sub-queries, reflects, and
+         synthesizes. Streams a live chain to the terminal. Slower (3-8s)
+         and uses more LLM calls; best for cross-memory questions.`,
 
-  "remember": `cogx remember <text> [--type TYPE] [--project NAME] [--json]
+  "remember": `cogx remember <text> [--type TYPE] [--project NAME] [--deep] [--json]
 
 Store a memory. Accepts piped stdin (combined with text args).
 
 Types:   semantic (default) | episodic | procedural | foundational
+--deep:  curated remember — recalls related memories first, classifies new
+         content as new / duplicate / refinement, and skips dupes. Streams a
+         live chain to the terminal.
 
 Examples:
   cogx remember "Auth refactor done"
   cat NOTES.md | cogx remember --type episodic
-  cogx remember --project myapp "Switched to PostgreSQL 16"`,
+  cogx remember --project myapp "Switched to PostgreSQL 16"
+  cogx remember --deep "We chose adaptive memory recall for iCog"`,
 
   "forget": `cogx forget <memory_id>
 
