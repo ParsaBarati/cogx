@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// cogx — iCog CLI. Pure Node.js, zero deps. Requires Node 18+.
+// cogx — CogX CLI. Pure Node.js, zero deps. Requires Node 18+.
 "use strict";
 
 const fs = require("fs");
@@ -13,7 +13,7 @@ if (typeof fetch !== "function") {
   process.exit(1);
 }
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const API_URL = (process.env.ICOG_API_URL || "https://i.cognitivx.io").replace(/\/$/, "");
 const ICOG_DIR = path.join(os.homedir(), ".icog");
 const CREDS_PATH = path.join(ICOG_DIR, "credentials.json");
@@ -151,7 +151,8 @@ function parseArgs(argv) {
       if (eq >= 0) { flags[a.slice(2, eq)] = a.slice(eq + 1); continue; }
       const key = a.slice(2);
       const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith("-")) { flags[key] = next; i++; }
+      if (["all", "deep", "force", "help", "json", "version"].includes(key)) flags[key] = true;
+      else if (next !== undefined && !next.startsWith("-")) { flags[key] = next; i++; }
       else flags[key] = true;
     } else if (a.startsWith("-") && a.length > 1) {
       const short = a.slice(1);
@@ -489,10 +490,52 @@ async function cmdAuthSet(args) {
 // Commands: mcp install
 // ---------------------------------------------------------------------------
 
+// Platform-aware config paths for every agent that speaks MCP's standard
+// `mcpServers` schema. Targets using non-standard schemas (Zed's
+// `context_servers`, Continue's nested config) are intentionally excluded —
+// they need format-specific writers.
+function appDataDir() {
+  if (process.platform === "darwin") return path.join(os.homedir(), "Library", "Application Support");
+  if (process.platform === "win32") return process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+  return path.join(os.homedir(), ".config");
+}
+
 const AGENT_TARGETS = {
-  claude:   { path: () => path.join(os.homedir(), ".claude", "mcp.json"), name: "Claude Code" },
-  cursor:   { path: () => path.join(os.homedir(), ".cursor", "mcp.json"), name: "Cursor" },
-  windsurf: { path: () => path.join(os.homedir(), ".codeium", "windsurf", "mcp_config.json"), name: "Windsurf" },
+  claude: {
+    name: "Claude Code",
+    path: () => path.join(os.homedir(), ".claude", "mcp.json"),
+    detect: () => fs.existsSync(path.join(os.homedir(), ".claude")),
+  },
+  "claude-desktop": {
+    name: "Claude Desktop",
+    path: () => path.join(appDataDir(), "Claude", "claude_desktop_config.json"),
+    detect: () => fs.existsSync(path.join(appDataDir(), "Claude")),
+  },
+  cursor: {
+    name: "Cursor",
+    path: () => path.join(os.homedir(), ".cursor", "mcp.json"),
+    detect: () => fs.existsSync(path.join(os.homedir(), ".cursor")),
+  },
+  windsurf: {
+    name: "Windsurf",
+    path: () => path.join(os.homedir(), ".codeium", "windsurf", "mcp_config.json"),
+    detect: () => fs.existsSync(path.join(os.homedir(), ".codeium", "windsurf")),
+  },
+  cline: {
+    name: "Cline (VS Code)",
+    path: () => path.join(
+      appDataDir(), "Code", "User", "globalStorage",
+      "saoudrizwan.claude-dev", "settings", "cline_mcp_settings.json",
+    ),
+    detect: () => fs.existsSync(path.join(
+      appDataDir(), "Code", "User", "globalStorage", "saoudrizwan.claude-dev",
+    )),
+  },
+  vscode: {
+    name: "VS Code",
+    path: () => path.join(os.homedir(), ".vscode", "mcp.json"),
+    detect: () => fs.existsSync(path.join(os.homedir(), ".vscode")),
+  },
 };
 
 function buildMcpConfig(apiKey) {
@@ -507,48 +550,117 @@ function buildMcpConfig(apiKey) {
   };
 }
 
-async function cmdMcpInstall(args, flags) {
-  const agent = args[0] || flags.agent || "claude";
-  const target = AGENT_TARGETS[agent];
-  if (!target) die(`unknown agent: ${agent}. choices: ${Object.keys(AGENT_TARGETS).join(", ")}`);
-
-  const apiKey = getApiKey();
+function writeMcpConfig(target, apiKey) {
   const cfgPath = target.path();
   fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
-
   let existing = {};
-  try { existing = JSON.parse(fs.readFileSync(cfgPath, "utf8")); } catch {}
-  const merged = { ...existing, mcpServers: { ...(existing.mcpServers || {}), ...buildMcpConfig(apiKey).mcpServers } };
+  try { existing = JSON.parse(fs.readFileSync(cfgPath, "utf8")); } catch { /* fresh file */ }
+  const merged = {
+    ...existing,
+    mcpServers: {
+      ...(existing.mcpServers || {}),
+      ...buildMcpConfig(apiKey).mcpServers,
+    },
+  };
   fs.writeFileSync(cfgPath, JSON.stringify(merged, null, 2));
+  return cfgPath;
+}
 
+function isAgentInstalled(target) {
+  try { return target.detect(); } catch { return false; }
+}
+
+async function cmdMcpInstall(args, flags) {
+  const apiKey = getApiKey();
+  const isAll = flags.all || args[0] === "all";
+
+  if (isAll) {
+    const results = [];
+    const skipped = [];
+    for (const [agentKey, target] of Object.entries(AGENT_TARGETS)) {
+      if (!isAgentInstalled(target)) { skipped.push({ agent: agentKey, name: target.name }); continue; }
+      const p = writeMcpConfig(target, apiKey);
+      results.push({ agent: agentKey, name: target.name, path: p });
+    }
+    if (JSON_MODE) {
+      console.log(JSON.stringify({ ok: true, installed: results, skipped }));
+      return;
+    }
+    if (!results.length) {
+      console.log(c.dim("no supported agents detected on this system."));
+      if (skipped.length) console.log(c.dim("  checked: " + skipped.map((s) => s.name).join(", ")));
+      return;
+    }
+    console.log(c.bold(`✓ installed iCog MCP for ${results.length} agent${results.length === 1 ? "" : "s"}:`));
+    for (const r of results) console.log(`  ${c.green("✓")} ${r.name} ${c.dim(r.path)}`);
+    if (skipped.length) {
+      console.log(c.dim(`\n  not detected (skipped): ${skipped.map((s) => s.name).join(", ")}`));
+    }
+    console.log(c.dim("\n  Restart the affected agents to activate."));
+    return;
+  }
+
+  const agent = args[0] || flags.agent || "claude";
+  const target = AGENT_TARGETS[agent];
+  if (!target) die(`unknown agent: ${agent}. choices: ${Object.keys(AGENT_TARGETS).join(", ")} | all`);
+
+  const cfgPath = writeMcpConfig(target, apiKey);
   out(
     `${c.green("✓")} installed iCog MCP for ${c.bold(target.name)}\n  ${c.dim(cfgPath)}\n\n  ${c.dim("Restart " + target.name + " to activate.")}`,
-    { ok: true, agent, path: cfgPath, name: target.name }
+    { ok: true, agent, path: cfgPath, name: target.name },
   );
 }
 
 function cmdMcpList() {
   const installed = [];
+  const detected = [];
   for (const [agent, target] of Object.entries(AGENT_TARGETS)) {
     const p = target.path();
+    const present = isAgentInstalled(target);
+    if (present) detected.push({ agent, name: target.name });
     try {
       const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
-      const has = cfg && cfg.mcpServers && cfg.mcpServers.icog;
-      if (has) installed.push({ agent, name: target.name, path: p });
-    } catch {}
+      if (cfg && cfg.mcpServers && cfg.mcpServers.icog) {
+        installed.push({ agent, name: target.name, path: p });
+      }
+    } catch { /* not configured */ }
   }
+  if (JSON_MODE) { console.log(JSON.stringify({ ok: true, installed, detected })); return; }
   if (!installed.length) {
-    out(c.dim("iCog MCP not installed in any known agent."), { ok: true, installed: [] });
+    console.log(c.dim("iCog MCP not installed in any known agent."));
+    if (detected.length) {
+      console.log(c.dim("  detected on system: " + detected.map((d) => d.name).join(", ")));
+      console.log(c.dim("  install everywhere: cogx mcp install --all"));
+    }
     return;
   }
-  if (JSON_MODE) { console.log(JSON.stringify({ ok: true, installed })); return; }
   console.log(c.bold("iCog MCP installed in:"));
   for (const i of installed) console.log(`  ${c.green("✓")} ${i.name} ${c.dim(i.path)}`);
 }
 
-async function cmdMcpUninstall(args) {
+async function cmdMcpUninstall(args, flags) {
+  const isAll = flags.all || args[0] === "all";
+  const removed = [];
+
+  if (isAll) {
+    for (const [agent, target] of Object.entries(AGENT_TARGETS)) {
+      const cfgPath = target.path();
+      let cfg;
+      try { cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8")); } catch { continue; }
+      if (!(cfg.mcpServers && cfg.mcpServers.icog)) continue;
+      delete cfg.mcpServers.icog;
+      fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+      removed.push({ agent, name: target.name });
+    }
+    if (JSON_MODE) { console.log(JSON.stringify({ ok: true, removed })); return; }
+    if (!removed.length) { console.log(c.dim("nothing to remove — iCog not found in any known config.")); return; }
+    console.log(c.bold(`✓ removed iCog from ${removed.length} agent${removed.length === 1 ? "" : "s"}:`));
+    for (const r of removed) console.log(`  ${c.green("✓")} ${r.name}`);
+    return;
+  }
+
   const agent = args[0];
-  if (!agent) die("usage: cogx mcp uninstall <agent>");
+  if (!agent) die("usage: cogx mcp uninstall <agent>  (or 'all' / --all)");
   const target = AGENT_TARGETS[agent];
   if (!target) die(`unknown agent: ${agent}`);
   const cfgPath = target.path();
@@ -558,6 +670,43 @@ async function cmdMcpUninstall(args) {
   if (cfg.mcpServers) delete cfg.mcpServers.icog;
   fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
   out(`${c.green("✓")} removed iCog from ${target.name}`, { ok: true, agent });
+}
+
+// Refresh the iCog entry in every config that already has one. Useful after
+// rotating an API key or switching ICOG_API_URL.
+async function cmdMcpUpdate(args, flags) {
+  const apiKey = getApiKey();
+  const targets = (flags.all || args[0] === "all" || !args[0])
+    ? Object.entries(AGENT_TARGETS)
+    : [[args[0], AGENT_TARGETS[args[0]]]];
+
+  if (!targets[0] || !targets[0][1]) die(`unknown agent: ${args[0]}`);
+
+  const updated = [];
+  const skipped = [];
+  for (const [agent, target] of targets) {
+    const cfgPath = target.path();
+    let cfg;
+    try { cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8")); }
+    catch { skipped.push({ agent, name: target.name, reason: "no-config" }); continue; }
+    if (!(cfg.mcpServers && cfg.mcpServers.icog)) {
+      skipped.push({ agent, name: target.name, reason: "no-icog" });
+      continue;
+    }
+    cfg.mcpServers.icog = buildMcpConfig(apiKey).mcpServers.icog;
+    fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+    updated.push({ agent, name: target.name, path: cfgPath });
+  }
+
+  if (JSON_MODE) { console.log(JSON.stringify({ ok: true, updated, skipped })); return; }
+  if (!updated.length) {
+    console.log(c.dim("nothing to update — iCog not found in any known config."));
+    console.log(c.dim("  run `cogx mcp install --all` to install everywhere."));
+    return;
+  }
+  console.log(c.bold(`✓ refreshed iCog MCP in ${updated.length} agent${updated.length === 1 ? "" : "s"}:`));
+  for (const u of updated) console.log(`  ${c.green("✓")} ${u.name} ${c.dim(u.path)}`);
+  console.log(c.dim("\n  Restart the affected agents to pick up the new credentials."));
 }
 
 // ---------------------------------------------------------------------------
@@ -836,6 +985,168 @@ async function cmdSearch(args, flags) {
 }
 
 // ---------------------------------------------------------------------------
+// Commands: doctor + self-update
+// ---------------------------------------------------------------------------
+
+// Fetch the latest published version of @cognitivx/cli from the npm registry.
+// Returns null on any failure (offline, registry down, parse error) so doctor
+// can keep reporting other checks instead of bailing.
+async function fetchLatestPublishedVersion() {
+  try {
+    const res = await fetch("https://registry.npmjs.org/@cognitivx/cli/latest", {
+      headers: { Accept: "application/json", "User-Agent": `cogx/${VERSION}` },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data?.version || null;
+  } catch { return null; }
+}
+
+// Numeric semver compare for "x.y.z" — returns -1 / 0 / 1.
+function compareSemver(a, b) {
+  const pa = String(a).split(".").map((n) => parseInt(n, 10) || 0);
+  const pb = String(b).split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) < (pb[i] || 0)) return -1;
+    if ((pa[i] || 0) > (pb[i] || 0)) return 1;
+  }
+  return 0;
+}
+
+async function cmdDoctor() {
+  const checks = [];
+  const add = (name, ok, detail, hint) => checks.push({ name, ok, detail, hint });
+
+  // Node version
+  const nodeMajor = parseInt(process.versions.node.split(".")[0], 10);
+  add("Node.js", nodeMajor >= 18, `v${process.versions.node}`, nodeMajor >= 18 ? null : "upgrade to Node 18 or newer");
+
+  // Fetch availability (already enforced at start, but report it)
+  add("fetch()", typeof fetch === "function", typeof fetch === "function" ? "built-in available" : "missing");
+
+  // Config dir
+  const credsExist = fs.existsSync(CREDS_PATH);
+  const envKey = !!process.env.ICOG_API_KEY;
+  add("Credentials", credsExist || envKey,
+    envKey ? "via ICOG_API_KEY env" : credsExist ? CREDS_PATH : "not found",
+    (credsExist || envKey) ? null : "run: cogx auth login");
+
+  // API URL reachable (no auth required for a HEAD-like probe — try /api/health
+  // and accept any 2xx/4xx as "reachable"; 5xx or network error fails the check)
+  let apiOk = false;
+  let apiDetail = API_URL;
+  try {
+    const res = await fetch(`${API_URL}/api/health`, { method: "GET" });
+    apiOk = res.status < 500;
+    apiDetail = `${API_URL} → ${res.status}`;
+  } catch (e) {
+    apiDetail = `${API_URL} → ${e.message}`;
+  }
+  add("API reachable", apiOk, apiDetail, apiOk ? null : "check network / ICOG_API_URL");
+
+  // Auth validity (only if credentials present)
+  let authOk = null;
+  let authDetail = "skipped — no credentials";
+  if (credsExist || envKey) {
+    try {
+      await httpRequest("GET", "/api/consciousness/reflect", { retries: false });
+      authOk = true;
+      authDetail = "key accepted";
+    } catch (e) {
+      authOk = false;
+      authDetail = e.message;
+    }
+    add("Auth", authOk, authDetail, authOk ? null : "run: cogx auth login");
+  } else {
+    add("Auth", null, authDetail);
+  }
+
+  // MCP install summary
+  const mcpInstalled = [];
+  for (const [agent, target] of Object.entries(AGENT_TARGETS)) {
+    try {
+      const cfg = JSON.parse(fs.readFileSync(target.path(), "utf8"));
+      if (cfg && cfg.mcpServers && cfg.mcpServers.icog) mcpInstalled.push(target.name);
+    } catch { /* not configured */ }
+  }
+  add("MCP installs", mcpInstalled.length > 0,
+    mcpInstalled.length ? mcpInstalled.join(", ") : "none configured",
+    mcpInstalled.length ? null : "run: cogx mcp install --all");
+
+  // Latest version check
+  const latest = await fetchLatestPublishedVersion();
+  if (latest) {
+    const cmp = compareSemver(VERSION, latest);
+    add("Version", cmp >= 0, `v${VERSION}${cmp < 0 ? ` → v${latest} available` : " (latest)"}`,
+      cmp < 0 ? "run: cogx self-update" : null);
+  } else {
+    add("Version", null, `v${VERSION} (offline, can't check latest)`);
+  }
+
+  if (JSON_MODE) { console.log(JSON.stringify({ ok: checks.every((c) => c.ok !== false), checks })); return; }
+
+  console.log(c.bold("cogx doctor"));
+  for (const ch of checks) {
+    const icon = ch.ok === true ? c.green("✓") : ch.ok === false ? c.red("✗") : c.dim("·");
+    const name = ch.name.padEnd(16);
+    const detail = ch.detail ? " " + c.dim(ch.detail) : "";
+    console.log(`  ${icon} ${name}${detail}`);
+    if (ch.hint && ch.ok === false) console.log(`    ${c.dim("→ " + ch.hint)}`);
+  }
+  const failed = checks.filter((c) => c.ok === false).length;
+  console.log("");
+  console.log(failed === 0 ? c.green("all clear.") : c.yellow(`${failed} issue${failed === 1 ? "" : "s"} to address.`));
+}
+
+async function cmdSelfUpdate(_args, flags) {
+  const latest = await fetchLatestPublishedVersion();
+  if (!latest) {
+    if (JSON_MODE) { console.log(JSON.stringify({ ok: false, error: "couldn't reach npm registry" })); return; }
+    die("couldn't reach npm registry — check network");
+  }
+  const cmp = compareSemver(VERSION, latest);
+  if (cmp >= 0 && !flags.force) {
+    if (JSON_MODE) { console.log(JSON.stringify({ ok: true, current: VERSION, latest, action: "noop" })); return; }
+    console.log(`${c.green("✓")} already on the latest version ${c.bold("v" + VERSION)}.`);
+    return;
+  }
+
+  if (JSON_MODE) {
+    console.log(JSON.stringify({ ok: true, current: VERSION, latest, action: "upgrade" }));
+  } else {
+    console.log(`${c.cyan("↑")} upgrading from ${c.bold("v" + VERSION)} → ${c.bold("v" + latest)} ...`);
+  }
+
+  // Run npm install in the user's shell. We don't try sudo or alternate package
+  // managers — if their environment needs sudo or uses pnpm/yarn, we tell them.
+  const cmd = "npm install -g @cognitivx/cli@latest";
+  await new Promise((resolve) => {
+    exec(cmd, { timeout: 120_000 }, (err, stdout, stderr) => {
+      if (err) {
+        if (JSON_MODE) {
+          console.log(JSON.stringify({ ok: false, error: err.message, hint: "may need sudo or different package manager" }));
+        } else {
+          console.log(c.red("✗ upgrade failed:"));
+          console.log(c.dim((stderr || err.message).trim()));
+          console.log("");
+          console.log(c.dim("try: sudo " + cmd));
+          console.log(c.dim("or:  pnpm add -g @cognitivx/cli@latest"));
+          console.log(c.dim("or:  yarn global add @cognitivx/cli@latest"));
+        }
+        resolve();
+        return;
+      }
+      if (JSON_MODE) {
+        console.log(JSON.stringify({ ok: true, current: VERSION, latest, action: "upgraded" }));
+      } else {
+        console.log(`${c.green("✓")} upgraded to ${c.bold("v" + latest)}.`);
+      }
+      resolve();
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Interactive chat (REPL) with persistent history
 // ---------------------------------------------------------------------------
 
@@ -940,23 +1251,39 @@ Precedence (highest first):
   2. ICOG_API_KEY env var
   3. Saved credentials at ~/.icog/credentials.json`,
 
-  "mcp install": `cogx mcp install [agent]
+  "mcp install": `cogx mcp install [agent | all] [--all]
 
 Install the iCog MCP into an agent's config file. Default agent: claude.
+Pass 'all' or --all to install into every detected agent on this system
+(only those whose config directory already exists — won't create new app
+data dirs for tools that aren't installed).
 
-Agents:  claude   (Claude Code)        ~/.claude/mcp.json
-         cursor   (Cursor)             ~/.cursor/mcp.json
-         windsurf (Windsurf)           ~/.codeium/windsurf/mcp_config.json
+Agents:  claude          (Claude Code)        ~/.claude/mcp.json
+         claude-desktop  (Claude Desktop)     <app-data>/Claude/claude_desktop_config.json
+         cursor          (Cursor)             ~/.cursor/mcp.json
+         windsurf        (Windsurf)           ~/.codeium/windsurf/mcp_config.json
+         cline           (Cline / VS Code)    <app-data>/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json
+         vscode          (VS Code native)     ~/.vscode/mcp.json
 
-Uses the remote HTTP MCP at ${API_URL}/mcp/. Restart the agent after install.`,
+Uses the remote HTTP MCP at ${API_URL}/mcp/. Restart the agents after install.`,
 
   "mcp list": `cogx mcp list
 
-List agents that have iCog MCP installed.`,
+List agents that have iCog MCP installed, plus which supported agents are
+detected on the system (so you can see what 'mcp install --all' would touch).`,
 
-  "mcp uninstall": `cogx mcp uninstall <agent>
+  "mcp uninstall": `cogx mcp uninstall <agent | all> [--all]
 
-Remove iCog from an agent's MCP config (leaves other servers intact).`,
+Remove iCog from an agent's MCP config (leaves other servers intact).
+Pass 'all' or --all to remove from every config that currently has it.`,
+
+  "mcp update": `cogx mcp update [agent | all] [--all]
+
+Refresh the iCog entry in every config that already has one — pulls a fresh
+API key (env > stored credentials) and rewrites the URL and headers. Useful
+after rotating a key or switching ICOG_API_URL. Skips configs that don't
+already have iCog installed (won't add it; use 'mcp install' for that).
+Defaults to all when no agent is specified.`,
 
   "recall": `cogx recall <query> [--type TYPE] [--limit N] [--project NAME] [--deep] [--json]
 
@@ -1031,6 +1358,20 @@ Register this agent with iCog so its talk() exchanges are attributed.
 
 Types: coding | research | writing | analysis | assistant | orchestrator | general`,
 
+  "doctor": `cogx doctor [--json]
+
+Run a self-diagnostic: Node version, fetch availability, credentials,
+API reachability, auth validity, MCP install status, and whether a newer
+version of cogx is published. Prints a summary with fix hints for any
+failing check.`,
+
+  "self-update": `cogx self-update [--force] [--json]
+
+Check the npm registry for a newer @cognitivx/cli and upgrade in place via
+\`npm install -g @cognitivx/cli@latest\`. Skips if already on the latest
+unless --force is passed. If the upgrade fails (permissions, alternate
+package manager), prints fallback commands for sudo/pnpm/yarn.`,
+
   "search": `cogx search <query> [--limit N] [--json]
 
 Web search via iCog (Tavily). Accepts piped stdin.`,
@@ -1041,7 +1382,7 @@ function help(cmdKey) {
     console.log(HELP_BY_CMD[cmdKey]);
     return;
   }
-  console.log(`${c.bold("cogx")} ${c.dim("v" + VERSION)} — iCog CLI
+  console.log(`${c.bold("cogx")} ${c.dim("v" + VERSION)} — CogX CLI
 
 ${c.bold("Usage:")}  cogx <command> [args] [flags]
 
@@ -1065,13 +1406,16 @@ ${c.bold("Setup:")}
   auth login                 sign in via browser device flow
   auth set <key>             save an API key directly (skip device flow)
   auth status | logout       check auth / clear credentials
-  mcp install [agent]        install iCog MCP (claude|cursor|windsurf)
-  mcp list                   list installed MCP integrations
-  mcp uninstall <agent>      remove from an agent
+  mcp install [agent|all]    install iCog MCP (claude|claude-desktop|cursor|windsurf|cline|vscode|all)
+  mcp list                   list installed MCP integrations + detected agents
+  mcp update [agent|all]     refresh existing iCog MCP entries (key rotation, URL change)
+  mcp uninstall <agent|all>  remove iCog from one or all agents
 
 ${c.bold("Other:")}
   identify <name>            register agent identity
   search <query>             web search via iCog
+  doctor                     diagnose install: node, auth, API, MCP, version
+  self-update                upgrade cogx to the latest published version
 
 ${c.bold("Global flags:")}
   --json, -j                 emit JSON output (machine-readable)
@@ -1112,6 +1456,7 @@ const COMMANDS = {
       "install":   cmdMcpInstall,
       "list":      cmdMcpList,
       "uninstall": cmdMcpUninstall,
+      "update":    cmdMcpUpdate,
     },
     helpKey: (sub) => `mcp ${sub}`,
   },
@@ -1129,6 +1474,8 @@ const COMMANDS = {
   "save-session": { fn: cmdSaveSession },
   "identify":     { fn: cmdIdentify },
   "search":       { fn: cmdSearch },
+  "doctor":       { fn: cmdDoctor },
+  "self-update":  { fn: cmdSelfUpdate },
 };
 
 (async () => {

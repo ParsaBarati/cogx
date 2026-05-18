@@ -1,6 +1,6 @@
 # cogx
 
-The iCog CLI — recall, remember, and talk to your personal AI from any terminal.
+The CogX CLI — recall, remember, and talk to your personal AI from any terminal.
 
 ```bash
 npm install -g cogx

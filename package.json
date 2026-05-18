@@ -1,7 +1,7 @@
 {
   "name": "@cognitivx/cli",
   "version": "1.1.0",
-  "description": "iCog CLI — recall, remember, and talk to your personal AI from any terminal. Pure Node.js, zero dependencies.",
+  "description": "CogX CLI — recall, remember, and talk to your personal AI from any terminal. Pure Node.js, zero dependencies.",
   "bin": {
     "cogx": "./index.js"
   },
