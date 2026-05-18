@@ -2,6 +2,11 @@
 
 All notable changes to `cogx` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [1.1.0] — 2026-05-18
+
+### Added
+- **Markdown rendering** for streamed responses (`talk`, `chat`, `reflect`, `introspect` narrative). Bold, italic, inline code, headings, blockquotes, lists, fenced code blocks, links, and `[Agent:slug→iCog]`/`[iCog→Agent]` exchange chips are all styled with ANSI escape codes in TTY contexts. Falls back to raw text for pipes, redirects, and `--json` mode. Zero new dependencies.
+
 ## [1.0.0] — 2026-05-09
 
 Initial public release.

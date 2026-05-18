@@ -28,6 +28,8 @@ const TTY = process.stdout.isTTY && !process.env.NO_COLOR;
 const c = {
   dim:   (s) => TTY ? `\x1b[2m${s}\x1b[0m` : s,
   bold:  (s) => TTY ? `\x1b[1m${s}\x1b[0m` : s,
+  italic:(s) => TTY ? `\x1b[3m${s}\x1b[0m` : s,
+  under: (s) => TTY ? `\x1b[4m${s}\x1b[0m` : s,
   cyan:  (s) => TTY ? `\x1b[36m${s}\x1b[0m` : s,
   green: (s) => TTY ? `\x1b[32m${s}\x1b[0m` : s,
   red:   (s) => TTY ? `\x1b[31m${s}\x1b[0m` : s,
@@ -35,6 +37,93 @@ const c = {
   gray:  (s) => TTY ? `\x1b[90m${s}\x1b[0m` : s,
   yellow:(s) => TTY ? `\x1b[33m${s}\x1b[0m` : s,
 };
+
+// ---------------------------------------------------------------------------
+// Markdown → ANSI renderer
+// ---------------------------------------------------------------------------
+//
+// Minimal markdown styling for streamed model output. Zero-dependency: parses
+// line by line with a few regex passes. Mirrors how claude-code and similar
+// CLIs surface bold/italic/code/headings/lists in the terminal. Falls back to
+// the raw string when stdout isn't a TTY (pipes, redirects).
+
+const TERM_WIDTH = (process.stdout.columns && process.stdout.columns > 20)
+  ? Math.min(process.stdout.columns, 100)
+  : 80;
+
+function inlineFmt(text) {
+  // Agent / iCog exchange chip — render as a soft cyan pill at the start.
+  // Matches [Agent:slug→iCog], [Agent→iCog], [iCog→Agent], [iCog→slug], [Agent], [iCog].
+  text = text.replace(
+    /^\[((?:Agent|iCog)(?::[^\]→]+)?(?:→[^\]]+)?)\]\s*/,
+    (_, body) => c.cyan(c.bold("⟨" + body + "⟩")) + " ",
+  );
+  // Inline code: `code` → cyan, no backticks.
+  text = text.replace(/`([^`\n]+)`/g, (_, body) => c.cyan(body));
+  // Links: [label](url) → underlined cyan label. URL dropped for compactness.
+  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label) => c.cyan(c.under(label)));
+  // Bold **text** or __text__ — handled before italic so the inner * isn't eaten.
+  text = text.replace(/\*\*([^*\n]+)\*\*/g, (_, body) => c.bold(body));
+  text = text.replace(/__([^_\n]+)__/g, (_, body) => c.bold(body));
+  // Italic *text* or _text_ — only when flanked by whitespace/punctuation, so
+  // we don't mangle identifiers like foo_bar_baz.
+  text = text.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,;:!?]|$)/g, (_, pre, body) => pre + c.italic(body));
+  text = text.replace(/(^|[\s(])_([^_\n]+)_(?=[\s).,;:!?]|$)/g, (_, pre, body) => pre + c.italic(body));
+  return text;
+}
+
+function renderMarkdown(input) {
+  if (!input || !TTY) return input || "";
+  const lines = String(input).split("\n");
+  const out = [];
+  let inCodeBlock = false;
+  for (const raw of lines) {
+    const fence = raw.match(/^\s*```(\w*)\s*$/);
+    if (fence) {
+      if (inCodeBlock) {
+        out.push(c.gray("└" + "─".repeat(Math.max(8, TERM_WIDTH - 2))));
+        inCodeBlock = false;
+      } else {
+        const lang = fence[1] || "code";
+        out.push(c.gray("┌─ " + lang + " " + "─".repeat(Math.max(2, TERM_WIDTH - 5 - lang.length))));
+        inCodeBlock = true;
+      }
+      continue;
+    }
+    if (inCodeBlock) {
+      out.push(c.gray("│ ") + c.dim(raw));
+      continue;
+    }
+    const head = raw.match(/^(#{1,6})\s+(.*)$/);
+    if (head) {
+      const level = head[1].length;
+      const body = inlineFmt(head[2]);
+      out.push(level <= 2 ? c.bold(c.cyan(body)) : c.bold(body));
+      continue;
+    }
+    if (/^\s*---+\s*$/.test(raw)) {
+      out.push(c.gray("─".repeat(Math.max(8, Math.floor(TERM_WIDTH / 2)))));
+      continue;
+    }
+    const quote = raw.match(/^>\s?(.*)$/);
+    if (quote) {
+      out.push(c.gray("│ ") + c.italic(c.dim(inlineFmt(quote[1]))));
+      continue;
+    }
+    const ul = raw.match(/^(\s*)[-*+]\s+(.*)$/);
+    if (ul) {
+      out.push(ul[1] + c.mag("•") + " " + inlineFmt(ul[2]));
+      continue;
+    }
+    const ol = raw.match(/^(\s*)(\d+)\.\s+(.*)$/);
+    if (ol) {
+      out.push(ol[1] + c.mag(ol[2] + ".") + " " + inlineFmt(ol[3]));
+      continue;
+    }
+    out.push(inlineFmt(raw));
+  }
+  return out.join("\n");
+}
 
 let JSON_MODE = false;
 function out(human, jsonObj) {
@@ -612,7 +701,7 @@ async function cmdTalk(args, flags) {
     console.log(JSON.stringify({ ok: true, response: result.response || "", context_used: result.context_used || 0 }));
     return;
   }
-  console.log(result.response || "");
+  console.log(renderMarkdown(result.response || ""));
   if (result.context_used) console.log(c.dim(`\n[${result.context_used} memories recalled]`));
 }
 
@@ -622,7 +711,7 @@ async function cmdReflect() {
   console.log(`${c.bold("Consciousness:")} ${c.mag(r.consciousness_level || "N/A")}`);
   console.log(`${c.bold("Memories:")}      ${r.memory_count || 0}`);
   if (r.captured_at) console.log(c.dim(`captured ${r.captured_at.slice(0, 19)}`));
-  if (r.narrative) { console.log(""); console.log(r.narrative); }
+  if (r.narrative) { console.log(""); console.log(renderMarkdown(r.narrative)); }
 }
 
 async function cmdIntrospect() {
@@ -638,7 +727,7 @@ async function cmdIntrospect() {
   if (JSON_MODE) { console.log(JSON.stringify({ ok: true, mood, personality, reflect })); return; }
   if (reflect) {
     console.log(`${c.bold("Consciousness:")} level ${c.mag(reflect.consciousness_level || "?")} | ${reflect.memory_count || 0} memories`);
-    if (reflect.narrative) console.log(c.dim("Narrative: ") + reflect.narrative);
+    if (reflect.narrative) console.log(c.dim("Narrative: ") + renderMarkdown(reflect.narrative));
   }
   if (mood && mood.effective) {
     const e = mood.effective;
@@ -805,7 +894,7 @@ async function cmdChat(_args, flags) {
         process.stdout.write(c.dim("thinking... "));
         const result = await httpRequest("POST", "/api/consciousness/talk", { body: { message } });
         process.stdout.write("\r" + " ".repeat(20) + "\r");
-        console.log(c.mag("icog ❮ ") + (result.response || ""));
+        console.log(c.mag("icog ❮ ") + renderMarkdown(result.response || ""));
         if (result.context_used) console.log(c.dim(`        [${result.context_used} memories recalled]`));
       }
     } catch (e) {
