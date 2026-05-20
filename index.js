@@ -13,8 +13,8 @@ if (typeof fetch !== "function") {
   process.exit(1);
 }
 
-const VERSION = "1.1.0";
-const API_URL = (process.env.ICOG_API_URL || "https://i.cognitivx.io").replace(/\/$/, "");
+const VERSION = "1.1.1";
+const API_URL = (process.env.ICOG_API_URL || "https://api.cognitivx.io").replace(/\/$/, "");
 const ICOG_DIR = path.join(os.homedir(), ".icog");
 const CREDS_PATH = path.join(ICOG_DIR, "credentials.json");
 const HISTORY_PATH = path.join(ICOG_DIR, "history");

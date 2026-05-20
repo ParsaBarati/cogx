@@ -2,6 +2,11 @@
 
 All notable changes to `cogx` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [1.1.1] — 2026-05-20
+
+### Fixed
+- **Default API root** moved from `https://i.cognitivx.io` to `https://api.cognitivx.io`. The old host now 308-redirects to `icog.app`, which served the SSR shell and broke CLI auth + recall + every other endpoint. The canonical API root has been `api.cognitivx.io` since v13.4. Existing users can override via `ICOG_API_URL` env var if needed.
+
 ## [1.1.0] — 2026-05-18
 
 ### Added
