@@ -503,8 +503,12 @@ function appDataDir() {
 const AGENT_TARGETS = {
   claude: {
     name: "Claude Code",
-    path: () => path.join(os.homedir(), ".claude", "mcp.json"),
-    detect: () => fs.existsSync(path.join(os.homedir(), ".claude")),
+    // Claude Code reads user-scope MCP servers from ~/.claude.json (key
+    // `mcpServers`), NOT ~/.claude/mcp.json — writing the latter is silently
+    // ignored on restart. (Project scope lives in <project>/.mcp.json.)
+    path: () => path.join(os.homedir(), ".claude.json"),
+    detect: () => fs.existsSync(path.join(os.homedir(), ".claude.json"))
+      || fs.existsSync(path.join(os.homedir(), ".claude")),
   },
   "claude-desktop": {
     name: "Claude Desktop",
@@ -553,8 +557,18 @@ function buildMcpConfig(apiKey) {
 function writeMcpConfig(target, apiKey) {
   const cfgPath = target.path();
   fs.mkdirSync(path.dirname(cfgPath), { recursive: true });
+  // Preserve every other key in the file (critical for ~/.claude.json, which
+  // holds all of Claude Code's state). Never clobber an existing-but-unparseable
+  // config — abort instead, so we can't wipe a user's settings on a transient
+  // read glitch.
   let existing = {};
-  try { existing = JSON.parse(fs.readFileSync(cfgPath, "utf8")); } catch { /* fresh file */ }
+  if (fs.existsSync(cfgPath)) {
+    const raw = fs.readFileSync(cfgPath, "utf8");
+    if (raw.trim()) {
+      try { existing = JSON.parse(raw); }
+      catch { die(`refusing to overwrite ${cfgPath} — it exists but is not valid JSON. Fix or remove it first.`); }
+    }
+  }
   const merged = {
     ...existing,
     mcpServers: {
@@ -1368,7 +1382,7 @@ Pass 'all' or --all to install into every detected agent on this system
 (only those whose config directory already exists — won't create new app
 data dirs for tools that aren't installed).
 
-Agents:  claude          (Claude Code)        ~/.claude/mcp.json
+Agents:  claude          (Claude Code)        ~/.claude.json
          claude-desktop  (Claude Desktop)     <app-data>/Claude/claude_desktop_config.json
          cursor          (Cursor)             ~/.cursor/mcp.json
          windsurf        (Windsurf)           ~/.codeium/windsurf/mcp_config.json

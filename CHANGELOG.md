@@ -15,6 +15,10 @@ All notable changes to `cogx` are documented here. Format follows [Keep a Change
   - `billing set-cap <usd|none>` — set or clear the monthly PAYG spend cap ($1–$10,000).
 - All subcommands support `--json` for machine-readable output.
 
+### Fixed
+- **`cogx mcp install claude` wrote to the wrong file.** It targeted `~/.claude/mcp.json`, which Claude Code does not read — so iCog never appeared after restart. Claude Code reads user-scope MCP servers from `~/.claude.json` (key `mcpServers`); the `claude` target now writes there. `mcp list` / `update` / `uninstall` follow the corrected path.
+- **`mcp install` no longer risks clobbering a config it can't parse.** It now aborts rather than overwriting an existing-but-invalid file — important for `~/.claude.json`, which holds all of Claude Code's state. Other top-level keys are always preserved.
+
 ## [1.1.1] — 2026-05-20
 
 ### Fixed
