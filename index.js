@@ -13,7 +13,7 @@ if (typeof fetch !== "function") {
   process.exit(1);
 }
 
-const VERSION = "1.1.1";
+const VERSION = "1.2.0";
 const API_URL = (process.env.ICOG_API_URL || "https://api.cognitivx.io").replace(/\/$/, "");
 const ICOG_DIR = path.join(os.homedir(), ".icog");
 const CREDS_PATH = path.join(ICOG_DIR, "credentials.json");
@@ -1222,6 +1222,116 @@ async function cmdChat(_args, flags) {
 // Help
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Billing / subscription — thin client over /api/billing/*
+// ---------------------------------------------------------------------------
+
+function fmtCredits(credits) {
+  const usd = (credits || 0) * 0.0001;
+  return `${(credits || 0).toLocaleString()} credits ${c.dim(`(~$${usd.toFixed(2)})`)}`;
+}
+
+async function cmdBillingStatus(_args, _flags) {
+  const [me, balance] = await Promise.all([
+    httpRequest("GET", "/api/billing/me"),
+    httpRequest("GET", "/api/billing/balance"),
+  ]);
+  if (JSON_MODE) { console.log(JSON.stringify({ ok: true, ...me, balance })); return; }
+  const bal = balance.balance_credits || 0;
+  console.log(`${c.bold("Plan:")}          ${c.mag(me.tier || "amnesiac")}`);
+  if (me.subscription_status) {
+    const iv = me.subscription_interval ? ` (${me.subscription_interval})` : "";
+    console.log(`${c.bold("Subscription:")}  ${me.subscription_status}${iv}`);
+  }
+  if (me.trial_ends_at) console.log(`${c.bold("Trial ends:")}    ${String(me.trial_ends_at).slice(0, 10)}`);
+  if (me.renewal_date) console.log(`${c.bold("Renews:")}        ${me.renewal_date}`);
+  console.log(`${c.bold("Balance:")}       ${fmtCredits(bal)}`);
+  const warn = [];
+  if (balance.low_balance) warn.push(c.yellow("LOW BALANCE"));
+  if (balance.depleted) warn.push(c.red("DEPLETED"));
+  if (warn.length) console.log(`${c.bold("Status:")}        ${warn.join(", ")}`);
+  if (me.payg_eligible) console.log(c.dim("Pay-as-you-go: eligible — `cogx billing switch-to-payg`"));
+}
+
+async function cmdBillingUsage(_args, _flags) {
+  const u = await httpRequest("GET", "/api/billing/usage");
+  if (JSON_MODE) { console.log(JSON.stringify({ ok: true, ...u })); return; }
+  if (u.message != null) console.log(`${c.bold("Messages:")}       ${u.message}`);
+  if (u.memories_saved_this_month != null) console.log(`${c.bold("Memories saved:")} ${u.memories_saved_this_month}`);
+  const cap = u.recall_credits_per_month;
+  const capStr = (typeof cap === "number") ? cap.toLocaleString() : "unlimited";
+  console.log(`${c.bold("Recall credits:")} ${(u.recall_credit_count || 0).toLocaleString()} / ${capStr}`);
+  const bd = u.recall_credit_breakdown || {};
+  const nz = Object.entries(bd).filter(([, v]) => v);
+  if (nz.length) console.log(c.dim("  by mode: " + nz.map(([k, v]) => `${k}=${v.toLocaleString()}`).join(", ")));
+  if (u.cap_reset_at) console.log(c.dim(`Resets ${String(u.cap_reset_at).slice(0, 10)}`));
+}
+
+async function cmdBillingTiers(_args, _flags) {
+  const tiers = await httpRequest("GET", "/api/billing/tiers", { auth: false });
+  if (JSON_MODE) { console.log(JSON.stringify({ ok: true, tiers })); return; }
+  for (const [name, cfg] of Object.entries(tiers)) {
+    const pm = cfg.price_monthly, pa = cfg.price_annual;
+    let price = !pm ? "free" : `$${pm}/mo`;
+    if (pa) price += ` or $${pa}/yr`;
+    const rc = cfg.recall_credits_per_month;
+    const rcStr = (typeof rc === "number") ? `${rc.toLocaleString()} recall credits/mo` : "metered (PAYG)";
+    const cap = cfg.memory_cap_total;
+    const capStr = (typeof cap === "number") ? `${cap.toLocaleString()} memories` : "unlimited memories";
+    console.log(`${c.bold(c.cyan(name.padEnd(10)))} ${c.dim(price.padEnd(18))} ${rcStr}, ${capStr}`);
+  }
+}
+
+async function cmdBillingSubscribe(args, flags) {
+  const tier = args[0];
+  if (!tier) die("usage: cogx billing subscribe <awakened|conscious> [--interval monthly|annual]");
+  const interval = flags.interval || "monthly";
+  const r = await httpRequest("POST", "/api/billing/create-checkout", { body: { tier, interval } });
+  if (JSON_MODE) { console.log(JSON.stringify({ ok: true, url: r.url || "" })); return; }
+  if (!r.url) die("checkout could not be created");
+  console.log(`${c.green("✓")} Open this URL to subscribe to ${c.mag(tier)} (${interval}):\n\n  ${c.under(c.cyan(r.url))}`);
+}
+
+async function cmdBillingPortal(_args, _flags) {
+  let r;
+  try { r = await httpRequest("POST", "/api/billing/create-portal"); }
+  catch (e) {
+    if (e.status === 400) die("no billing account yet — run `cogx billing subscribe <tier>` first");
+    throw e;
+  }
+  if (JSON_MODE) { console.log(JSON.stringify({ ok: true, url: r.url || "" })); return; }
+  console.log(`${c.green("✓")} Manage your subscription (update card, invoices, cancel):\n\n  ${c.under(c.cyan(r.url))}`);
+}
+
+async function cmdBillingSwitchPayg(_args, flags) {
+  const refund_method = flags.refund || "credit";
+  const r = await httpRequest("POST", "/api/billing/switch-to-payg", { body: { refund_method } });
+  if (JSON_MODE) { console.log(JSON.stringify({ ok: true, ...r })); return; }
+  if (r.already_payg) { console.log(c.dim("already on Pay-as-You-Go")); return; }
+  console.log(`${c.green("✓")} switched to ${c.mag(r.new_tier || "payg")}`);
+  if (r.refunded_usd) console.log(c.dim(`  prorated ${r.refund_method || "credit"}: $${Number(r.refunded_usd).toFixed(2)}`));
+  if (r.requires_topup) console.log(c.yellow("  balance is $0 — top up to keep using metered features"));
+}
+
+async function cmdBillingSetCap(args, _flags) {
+  const v = args[0];
+  if (!v) die("usage: cogx billing set-cap <usd|none>");
+  let monthly_cap_usd;
+  if (["none", "clear", "off"].includes(v.toLowerCase())) {
+    monthly_cap_usd = null;
+  } else {
+    monthly_cap_usd = Number(v);
+    if (!isFinite(monthly_cap_usd) || monthly_cap_usd < 1 || monthly_cap_usd > 10000) {
+      die("cap must be a dollar amount between 1 and 10000, or 'none' to clear");
+    }
+  }
+  const r = await httpRequest("PUT", "/api/billing/payg-cap", { body: { monthly_cap_usd } });
+  if (JSON_MODE) { console.log(JSON.stringify({ ok: true, ...r })); return; }
+  const spent = Number(r.spent_this_month_usd || 0).toFixed(2);
+  if (r.monthly_cap_usd == null) console.log(`${c.green("✓")} spend cap cleared (no limit). spent this month: $${spent}`);
+  else console.log(`${c.green("✓")} monthly spend cap set to $${Number(r.monthly_cap_usd).toFixed(2)}. spent this month: $${spent}`);
+}
+
 const HELP_BY_CMD = {
   "auth login": `cogx auth login
 
@@ -1375,6 +1485,44 @@ package manager), prints fallback commands for sudo/pnpm/yarn.`,
   "search": `cogx search <query> [--limit N] [--json]
 
 Web search via iCog (Tavily). Accepts piped stdin.`,
+
+  "billing status": `cogx billing status [--json]
+
+Show your plan, subscription state, renewal date, and credit balance
+(with low-balance / depleted warnings).`,
+
+  "billing usage": `cogx billing usage [--json]
+
+Show this billing cycle's usage: messages, memories saved, and recall
+credits consumed vs your tier's monthly allowance (with a per-mode breakdown).`,
+
+  "billing tiers": `cogx billing tiers [--json]
+
+List the available subscription tiers with prices and monthly allowances.
+Public — no authentication required.`,
+
+  "billing subscribe": `cogx billing subscribe <tier> [--interval monthly|annual] [--json]
+
+Start (or upgrade to) a paid subscription. Tiers: awakened | conscious.
+Prints a Stripe Checkout URL — open it in a browser to enter card details.
+The CLI never handles card data.`,
+
+  "billing portal": `cogx billing portal [--json]
+
+Open the Stripe customer portal to update your card, view invoices, or
+cancel. Prints a portal URL. Requires an existing billing account.`,
+
+  "billing switch-to-payg": `cogx billing switch-to-payg [--refund credit|card] [--json]
+
+Switch to Pay-as-You-Go (metered) billing. Cancels any active subscription
+and prorates unused time. --refund credit (default) leaves proration on your
+Stripe balance; --refund card refunds to the original payment method.`,
+
+  "billing set-cap": `cogx billing set-cap <usd|none> [--json]
+
+Set or clear your monthly Pay-as-You-Go spending cap ($1 to $10,000). Once
+the cap is reached, metered actions are blocked until the next month. Pass
+'none' to remove the cap.`,
 };
 
 function help(cmdKey) {
@@ -1410,6 +1558,15 @@ ${c.bold("Setup:")}
   mcp list                   list installed MCP integrations + detected agents
   mcp update [agent|all]     refresh existing iCog MCP entries (key rotation, URL change)
   mcp uninstall <agent|all>  remove iCog from one or all agents
+
+${c.bold("Billing:")}
+  billing status             plan, subscription state, credit balance
+  billing usage              this cycle's usage vs your tier's caps
+  billing tiers              list plans with prices and allowances
+  billing subscribe <tier>   start/upgrade a subscription (Stripe Checkout URL)
+  billing portal             manage card/invoices/cancel (Stripe portal URL)
+  billing switch-to-payg     move to pay-as-you-go (metered) billing
+  billing set-cap <usd|none> set/clear the monthly PAYG spend cap
 
 ${c.bold("Other:")}
   identify <name>            register agent identity
@@ -1459,6 +1616,18 @@ const COMMANDS = {
       "update":    cmdMcpUpdate,
     },
     helpKey: (sub) => `mcp ${sub}`,
+  },
+  "billing": {
+    sub: {
+      "status":         cmdBillingStatus,
+      "usage":          cmdBillingUsage,
+      "tiers":          cmdBillingTiers,
+      "subscribe":      cmdBillingSubscribe,
+      "portal":         cmdBillingPortal,
+      "switch-to-payg": cmdBillingSwitchPayg,
+      "set-cap":        cmdBillingSetCap,
+    },
+    helpKey: (sub) => `billing ${sub}`,
   },
   "recall":       { fn: cmdRecall },
   "remember":     { fn: cmdRemember },

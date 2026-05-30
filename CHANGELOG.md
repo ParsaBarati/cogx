@@ -2,6 +2,19 @@
 
 All notable changes to `cogx` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [1.2.0] — 2026-05-30
+
+### Added
+- **`cogx billing`** — manage your subscription and credits from the terminal, over the `/api/billing/*` API. Subcommands:
+  - `billing status` — plan, subscription state, renewal date, and credit balance (with low-balance / depleted warnings).
+  - `billing usage` — this cycle's messages, memories saved, and recall credits vs your tier's monthly cap (per-mode breakdown).
+  - `billing tiers` — list plans with prices and allowances (public, no auth).
+  - `billing subscribe <tier> [--interval monthly|annual]` — start/upgrade a subscription; prints a Stripe Checkout URL (the CLI never handles card data).
+  - `billing portal` — Stripe customer portal URL to update card, view invoices, or cancel.
+  - `billing switch-to-payg [--refund credit|card]` — move to pay-as-you-go metered billing.
+  - `billing set-cap <usd|none>` — set or clear the monthly PAYG spend cap ($1–$10,000).
+- All subcommands support `--json` for machine-readable output.
+
 ## [1.1.1] — 2026-05-20
 
 ### Fixed

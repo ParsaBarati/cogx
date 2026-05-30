@@ -142,6 +142,27 @@ cogx save-session "shipped the install page" --project cogx-cli
 
 ---
 
+## Billing
+
+Manage your subscription and credits from the terminal. Paid actions print a
+Stripe-hosted URL — the CLI never handles card data.
+
+```bash
+cogx billing status                      # plan, subscription state, credit balance
+cogx billing usage                       # this cycle's usage vs your tier's caps
+cogx billing tiers                       # list plans with prices and allowances
+
+cogx billing subscribe awakened          # → Stripe Checkout URL (monthly)
+cogx billing subscribe conscious --interval annual
+cogx billing portal                      # → Stripe portal: card, invoices, cancel
+
+cogx billing switch-to-payg              # move to pay-as-you-go (metered)
+cogx billing set-cap 50                  # cap PAYG spend at $50/month
+cogx billing set-cap none                # remove the cap
+```
+
+---
+
 ## Wire iCog into your coding agent
 
 ```bash
