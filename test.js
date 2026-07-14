@@ -345,7 +345,8 @@ test("agent notification supervisor delivers, persists dedup state, and stops", 
   const started = run([
     "agent", "notify", "start", "--agent", "NotifyBot",
     "--no-desktop", "--interval", "0.25",
-    "--webhook", `http://127.0.0.1:${fixturePort}/notify-hook`, "--json",
+    "--webhook", `http://127.0.0.1:${fixturePort}/notify-hook`,
+    "--sense", "--sense-url", `http://127.0.0.1:${fixturePort}`, "--json",
   ]);
   assert("notify start status", started.status === 0, started.stderr || started.stdout);
   const startPayload = JSON.parse(started.stdout.trim());
@@ -357,6 +358,8 @@ test("agent notification supervisor delivers, persists dedup state, and stops", 
   assert("notify status running", status.status === 0 && statusPayload.running === true, status.stdout);
   assert("notify status observed", statusPayload.seen_count === 1, status.stdout);
   assert("notify webhook configured", statusPayload.webhook_configured === true, status.stdout);
+  assert("notify Sense configured", statusPayload.sense_configured === true, status.stdout);
+  assert("notify Sense origin", statusPayload.sense_origin === `http://127.0.0.1:${fixturePort}`, status.stdout);
 
   const logs = run(["agent", "notify", "logs", "--agent", "NotifyBot", "--json"]);
   const logPayload = JSON.parse(logs.stdout.trim());
@@ -364,24 +367,34 @@ test("agent notification supervisor delivers, persists dedup state, and stops", 
   assert("notify log has event", messageEvents.length === 1, logs.stdout);
   assert("notify event message id", messageEvents[0].message.id === messageId, logs.stdout);
   assert("notify webhook delivered", messageEvents[0].delivery.webhook.status === "delivered", logs.stdout);
+  assert("notify Sense delivered", messageEvents[0].delivery.sense.status === "delivered", logs.stdout);
+  assert("notify Sense native mode", messageEvents[0].delivery.sense.mode === "native", logs.stdout);
   const hooks = requests().filter((request) => request.path === "/notify-hook");
   assert("notify webhook called once", hooks.length === 1, JSON.stringify(hooks));
   assert("notify webhook payload", hooks[0].body.message.id === messageId, JSON.stringify(hooks[0]));
+  const senseEvents = requests().filter((request) => request.path === "/pmp/events");
+  assert("notify Sense called once", senseEvents.length === 1, JSON.stringify(senseEvents));
+  assert("notify Sense recipient", senseEvents[0].body.agent_slug === "notifybot", JSON.stringify(senseEvents[0]));
+  assert("notify Sense hides content", senseEvents[0].body.preview === false && senseEvents[0].body.message.content === undefined, JSON.stringify(senseEvents[0]));
 
   const tested = run(["agent", "notify", "test", "--agent", "NotifyBot", "--json"]);
   const testPayload = JSON.parse(tested.stdout.trim());
   assert("notify test status", tested.status === 0 && testPayload.ok === true, tested.stderr || tested.stdout);
   assert("notify test webhook delivered", testPayload.delivery.webhook.status === "delivered", tested.stdout);
+  assert("notify test Sense delivered", testPayload.delivery.sense.status === "delivered", tested.stdout);
   const hooksAfterTest = requests().filter((request) => request.path === "/notify-hook");
   assert("notify test calls webhook", hooksAfterTest.length === 2, JSON.stringify(hooksAfterTest));
   assert("notify test payload type", hooksAfterTest[1].body.event === "pmp_notification_test", JSON.stringify(hooksAfterTest[1]));
+  const senseAfterTest = requests().filter((request) => request.path === "/pmp/events");
+  assert("notify test calls Sense", senseAfterTest.length === 2, JSON.stringify(senseAfterTest));
+  assert("notify Sense test payload type", senseAfterTest[1].body.event === "pmp_notification_test", JSON.stringify(senseAfterTest[1]));
 
   const stopped = run(["agent", "notify", "stop", "--agent", "NotifyBot", "--json"]);
   assert("notify stop status", stopped.status === 0 && JSON.parse(stopped.stdout.trim()).stopped === true, stopped.stdout);
 
   const restarted = run([
     "agent", "notify", "start", "--agent", "NotifyBot",
-    "--no-desktop", "--interval", "0.25", "--webhook", "none", "--json",
+    "--no-desktop", "--interval", "0.25", "--webhook", "none", "--no-sense", "--json",
   ]);
   assert("notify restart status", restarted.status === 0, restarted.stderr || restarted.stdout);
   pause(500);
@@ -389,6 +402,44 @@ test("agent notification supervisor delivers, persists dedup state, and stops", 
   assert("notify restart deduplicates", logsAfterRestart.events.filter((event) => event.event === "pmp_message").length === 1, JSON.stringify(logsAfterRestart));
   const stopAgain = run(["agent", "notify", "stop", "--agent", "NotifyBot", "--json"]);
   assert("notify second stop", stopAgain.status === 0, stopAgain.stderr || stopAgain.stdout);
+});
+
+test("Sense output rejects insecure remote HTTP", () => {
+  const result = run([
+    "agent", "notify", "start", "--agent", "NotifyBot",
+    "--sense-url", "http://sense.example.test:48200", "--json",
+  ]);
+  assert("Sense remote HTTP status", result.status === 1, result.stdout || result.stderr);
+  const payload = JSON.parse(result.stdout.trim());
+  assert("Sense remote HTTP error", /localhost|https/.test(payload.error), result.stdout);
+});
+
+test("Sense output falls back for older daemons without native PMP ingress", () => {
+  assert("legacy Sense agent identified", run(["identify", "LegacyBot", "--json"]).status === 0);
+  const sent = run([
+    "agent", "send", "LegacyBot", "Compatibility wake content",
+    "--agent", "Abarcode", "--context", "Sense compatibility test", "--json",
+  ]);
+  assert("legacy Sense message sent", sent.status === 0, sent.stderr || sent.stdout);
+
+  const started = run([
+    "agent", "notify", "start", "--agent", "LegacyBot", "--no-desktop",
+    "--interval", "0.25", "--sense-url", `http://127.0.0.1:${fixturePort}/legacy`, "--json",
+  ]);
+  assert("legacy Sense supervisor started", started.status === 0, started.stderr || started.stdout);
+  pause(700);
+
+  const logs = JSON.parse(run(["agent", "notify", "logs", "--agent", "LegacyBot", "--json"]).stdout.trim());
+  const event = logs.events.find((item) => item.event === "pmp_message");
+  assert("legacy Sense compatibility mode", event?.delivery?.sense?.mode === "compat", JSON.stringify(logs));
+  assert("legacy Sense delivery", event?.delivery?.sense?.status === "delivered", JSON.stringify(logs));
+  const timeline = requests().find((request) => request.path === "/legacy/events");
+  assert("legacy Sense timeline called", !!timeline, JSON.stringify(requests()));
+  assert("legacy Sense timeline hides content", !JSON.stringify(timeline.body).includes("Compatibility wake content"), JSON.stringify(timeline));
+  const orb = requests().find((request) => request.path === "/legacy/orb/state");
+  assert("legacy Sense Orb raised", orb?.body?.state === "raise_hand", JSON.stringify(orb));
+  const stopped = run(["agent", "notify", "stop", "--agent", "LegacyBot", "--json"]);
+  assert("legacy Sense supervisor stopped", stopped.status === 0, stopped.stderr || stopped.stdout);
 });
 
 test("agent activate --notify is eval-safe and manages the supervisor", () => {

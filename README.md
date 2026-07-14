@@ -159,7 +159,7 @@ Or activate it only in the current shell and start its background notification
 supervisor in one command:
 
 ```bash
-eval "$(cogx agent activate Aporta --notify)"
+eval "$(cogx agent activate Aporta --notify --sense)"
 cogx agent status
 cogx agent notify status --agent Aporta
 ```
@@ -167,6 +167,8 @@ cogx agent notify status --agent Aporta
 Activation checks the selected agent's inbox and prints any unread notice to
 stderr, keeping stdout safe for `eval`. `--notify` starts a detached supervisor
 that survives the invoking shell and deduplicates notifications across restarts.
+`--sense` also records a privacy-safe local Sense event and raises the Orb under
+Sense's attention and quiet-hours policy.
 
 Manage it explicitly when needed:
 
@@ -178,9 +180,21 @@ cogx agent notify logs --agent Aporta --limit 20
 cogx agent notify stop --agent Aporta
 ```
 
+Wire an agent directly into the local Sense Orb:
+
+```bash
+cogx agent notify start --agent Aporta --sense
+# Equivalent one-command shell activation:
+eval "$(cogx agent activate Aporta --notify --sense)"
+```
+
+Sense receives message metadata by default, not content. `--preview` explicitly
+allows a redacted content preview. Override the local daemon only when needed
+with `--sense-url https://sense-host.example`; non-loopback HTTP is rejected.
+
 Desktop notifications are enabled on macOS and Linux but hide message content
 by default. Add `--preview` to show content, `--no-desktop` for headless hosts,
-or a webhook to connect PMP to a host-runtime wake mechanism:
+or a webhook to connect PMP to another host-runtime wake mechanism:
 
 ```bash
 cogx agent notify start --agent Aporta --preview

@@ -13,8 +13,9 @@ if (typeof fetch !== "function") {
   process.exit(1);
 }
 
-const VERSION = "1.4.0";
+const VERSION = "1.5.0";
 const API_URL = (process.env.ICOG_API_URL || "https://api.cognitivx.io").replace(/\/$/, "");
+const DEFAULT_SENSE_URL = (process.env.COGX_SENSE_URL || "http://127.0.0.1:48200").replace(/\/$/, "");
 const ICOG_DIR = path.join(os.homedir(), ".icog");
 const CREDS_PATH = path.join(ICOG_DIR, "credentials.json");
 const HISTORY_PATH = path.join(ICOG_DIR, "history");
@@ -152,7 +153,7 @@ function parseArgs(argv) {
       if (eq >= 0) { flags[a.slice(2, eq)] = a.slice(eq + 1); continue; }
       const key = a.slice(2);
       const next = argv[i + 1];
-      if (["all", "as-user", "deep", "desktop", "force", "help", "json", "no-desktop", "no-preview", "notify", "preview", "replay", "version"].includes(key)) flags[key] = true;
+      if (["all", "as-user", "deep", "desktop", "force", "help", "json", "no-desktop", "no-preview", "no-sense", "notify", "preview", "replay", "sense", "version"].includes(key)) flags[key] = true;
       else if (next !== undefined && !next.startsWith("-")) { flags[key] = next; i++; }
       else flags[key] = true;
     } else if (a.startsWith("-") && a.length > 1) {
@@ -1257,6 +1258,10 @@ function notificationStateForOutput(slug, state = readNotifyState(slug)) {
   if (state.webhook) {
     try { webhookOrigin = new URL(state.webhook).origin; } catch { webhookOrigin = "configured"; }
   }
+  let senseOrigin = null;
+  if (state.sense_url) {
+    try { senseOrigin = new URL(state.sense_url).origin; } catch { senseOrigin = "configured"; }
+  }
   return {
     agent_slug: slug,
     configured: true,
@@ -1269,6 +1274,8 @@ function notificationStateForOutput(slug, state = readNotifyState(slug)) {
     preview: !!state.preview,
     webhook_configured: !!state.webhook,
     webhook_origin: webhookOrigin,
+    sense_configured: !!state.sense_url,
+    sense_origin: senseOrigin,
     seen_count: Array.isArray(state.seen_message_ids) ? state.seen_message_ids.length : 0,
     last_poll_at: state.last_poll_at || null,
     last_event_at: state.last_event_at || null,
@@ -1288,6 +1295,25 @@ function normalizeWebhookUrl(value) {
     die("--webhook must use http or https");
   }
   return parsed.toString();
+}
+
+function normalizeSenseUrl(value) {
+  if (!value) return "";
+  let parsed;
+  try { parsed = new URL(String(value)); }
+  catch { die("--sense-url must be a valid http(s) URL"); }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    die("--sense-url must use http or https");
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+    die("--sense-url must be a base URL without credentials, query, or fragment");
+  }
+  const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
+  if (parsed.protocol === "http:" && !loopbackHosts.has(parsed.hostname)) {
+    die("insecure --sense-url is allowed only for localhost; use https for remote Sense hosts");
+  }
+  parsed.pathname = parsed.pathname.replace(/\/$/, "");
+  return parsed.toString().replace(/\/$/, "");
 }
 
 function desktopNotification(slug, message, { enabled, preview }) {
@@ -1335,6 +1361,107 @@ async function webhookNotification(url, event) {
   }
 }
 
+async function senseRequest(baseUrl, route, body) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(`${baseUrl}${route}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "User-Agent": `cogx/${VERSION}` },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    let payload = null;
+    try { payload = await response.json(); } catch { /* response body is optional */ }
+    return { ok: response.ok, status: response.status, payload };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function senseNotificationPayload(event, { preview }) {
+  const message = event.message || {};
+  return {
+    event: event.event,
+    agent_slug: event.agent_slug,
+    observed_at: event.observed_at,
+    preview: !!preview,
+    message: {
+      id: String(message.id || "notification-test"),
+      sender_slug: message.sender_slug || null,
+      message_kind: message.message_kind || "message",
+      delivery_status: message.delivery_status || null,
+      thread_id: message.thread_id || null,
+      sent_at: message.sent_at || null,
+      ...(preview ? { content: String(message.content || "") } : {}),
+    },
+  };
+}
+
+async function senseNotification(baseUrl, event, { preview }) {
+  if (!baseUrl) return { status: "disabled" };
+  const payload = senseNotificationPayload(event, { preview });
+  try {
+    const native = await senseRequest(baseUrl, "/pmp/events", payload);
+    if (native.ok) {
+      return {
+        status: "delivered",
+        mode: "native",
+        decision: native.payload?.decision || null,
+        orb_notified: !!native.payload?.orb_notified,
+        duplicate: !!native.payload?.duplicate,
+      };
+    }
+    if (native.status !== 404) {
+      return { status: "failed", error: `Sense HTTP ${native.status}` };
+    }
+
+    // Compatibility path for Sense versions predating /pmp/events. Persist
+    // metadata only, then send a privacy-safe raise_hand frame to the Orb.
+    const message = payload.message;
+    const sender = message.sender_slug || "another agent";
+    const caption = preview && message.content
+      ? `${sender}: ${String(message.content).replace(/\s+/g, " ").slice(0, 64)}`
+      : `PMP ${message.message_kind || "message"} from ${sender} for ${payload.agent_slug}`;
+    const timeline = await senseRequest(baseUrl, "/events", {
+      ts: Date.now() / 1000,
+      source: "pmp",
+      kind: payload.event,
+      project: payload.agent_slug,
+      data: {
+        message_id: message.id,
+        sender_slug: message.sender_slug,
+        recipient_slug: payload.agent_slug,
+        message_kind: message.message_kind,
+        delivery_status: message.delivery_status,
+        thread_id: message.thread_id,
+        sent_at: message.sent_at,
+        observed_at: payload.observed_at,
+        preview: false,
+      },
+    });
+    if (!timeline.ok) return { status: "failed", mode: "compat", error: `Sense /events HTTP ${timeline.status}` };
+    const orb = await senseRequest(baseUrl, "/orb/state", {
+      state: "raise_hand",
+      energy: 0.45,
+      hue: 0.12,
+      turbulence: 0.6,
+      pulse_rate: 0.8,
+      caption: caption.slice(0, 80),
+    });
+    if (!orb.ok) return { status: "failed", mode: "compat", error: `Sense /orb/state HTTP ${orb.status}` };
+    return {
+      status: "delivered",
+      mode: "compat",
+      event_id: timeline.payload?.id || null,
+      orb_clients: Number(orb.payload?.clients || 0),
+      orb_notified: true,
+    };
+  } catch (error) {
+    return { status: "failed", error: error.message || String(error) };
+  }
+}
+
 async function stopNotificationSupervisor(slug) {
   const state = readNotifyState(slug);
   if (!state || !processIsAlive(state.pid)) {
@@ -1366,11 +1493,19 @@ async function startNotificationSupervisor(slug, flags = {}) {
   const webhook = flags.webhook !== undefined
     ? normalizeWebhookUrl(flags.webhook)
     : previous?.webhook || "";
+  if (flags.sense && flags["no-sense"]) die("--sense and --no-sense cannot be used together");
+  const senseUrl = flags["no-sense"]
+    ? ""
+    : flags["sense-url"] !== undefined
+      ? normalizeSenseUrl(flags["sense-url"])
+      : flags.sense
+        ? normalizeSenseUrl(DEFAULT_SENSE_URL)
+        : previous?.sense_url || "";
   const desktop = flags.desktop ? true : flags["no-desktop"] ? false : previous?.desktop !== false;
   const preview = flags.preview ? true : flags["no-preview"] ? false : !!previous?.preview;
   const paths = ensureNotifyDir(slug);
   const state = {
-    version: 1,
+    version: 2,
     agent_slug: slug,
     pid: null,
     running: false,
@@ -1380,6 +1515,7 @@ async function startNotificationSupervisor(slug, flags = {}) {
     desktop,
     preview,
     webhook,
+    sense_url: senseUrl,
     seen_message_ids: flags.replay ? [] : (previous?.seen_message_ids || []),
     last_poll_at: previous?.last_poll_at || null,
     last_event_at: previous?.last_event_at || null,
@@ -1438,6 +1574,7 @@ async function runNotificationSupervisor(slug) {
           event.delivery = {
             desktop: desktopNotification(slug, message, { enabled: state.desktop, preview: state.preview }),
             webhook: await webhookNotification(state.webhook, event),
+            sense: await senseNotification(state.sense_url, event, { preview: state.preview }),
           };
           appendNotifyEvent(slug, event);
           seen.add(message.id);
@@ -1446,7 +1583,7 @@ async function runNotificationSupervisor(slug) {
             seen_message_ids: [...seen].slice(-2000),
             last_event_at: event.observed_at,
             last_sender: message.sender_slug || null,
-            last_error: [event.delivery.desktop, event.delivery.webhook]
+            last_error: [event.delivery.desktop, event.delivery.webhook, event.delivery.sense]
               .filter((result) => result.status === "failed")
               .map((result) => result.error)
               .join("; ") || null,
@@ -1519,7 +1656,7 @@ async function cmdAgentNotify(args, flags) {
     else {
       console.log(`${state.running ? c.green("● running") : c.gray("○ stopped")} ${c.bold(slug)}${state.pid ? ` (pid ${state.pid})` : ""}`);
       if (state.configured) {
-        console.log(c.dim(`  poll ${state.interval_seconds}s · desktop ${state.desktop ? "on" : "off"} · webhook ${state.webhook_configured ? state.webhook_origin : "off"}`));
+        console.log(c.dim(`  poll ${state.interval_seconds}s · desktop ${state.desktop ? "on" : "off"} · webhook ${state.webhook_configured ? state.webhook_origin : "off"} · Sense ${state.sense_configured ? state.sense_origin : "off"}`));
         console.log(c.dim(`  observed ${state.seen_count} · last poll ${state.last_poll_at || "never"} · last event ${state.last_event_at || "never"}`));
         if (state.last_error) console.log(c.yellow(`  last error: ${state.last_error}`));
       }
@@ -1559,6 +1696,7 @@ async function cmdAgentNotify(args, flags) {
     const delivery = {
       desktop: desktopNotification(slug, event.message, { enabled: state.desktop, preview: state.preview }),
       webhook: await webhookNotification(state.webhook, event),
+      sense: await senseNotification(state.sense_url, event, { preview: state.preview }),
     };
     appendNotifyEvent(slug, { ...event, delivery });
     const failed = Object.values(delivery).filter((result) => result.status === "failed");
@@ -1566,7 +1704,7 @@ async function cmdAgentNotify(args, flags) {
     if (JSON_MODE) console.log(JSON.stringify({ ok: failed.length === 0, agent_slug: slug, delivery }));
     else {
       console.log(`${failed.length ? c.yellow("!") : c.green("✓")} notification test for ${slug}`);
-      console.log(c.dim(`  desktop ${delivery.desktop.status} · webhook ${delivery.webhook.status}`));
+      console.log(c.dim(`  desktop ${delivery.desktop.status} · webhook ${delivery.webhook.status} · Sense ${delivery.sense.status}`));
     }
     return;
   }
@@ -2375,11 +2513,12 @@ List registered agents and synchronize the local identity catalog.`,
 
 Show the current session-safe identity and all locally known agents.`,
 
-  "agent activate": `eval "$(cogx agent activate <slug> [--notify])"
+  "agent activate": `eval "$(cogx agent activate <slug> [--notify] [--sense])"
 
 Print a shell export for COGX_AGENT_SLUG. Activation is shell-session local;
 it never mutates another terminal or agent session. --notify also starts the
-background notification supervisor for this identity.`,
+background notification supervisor for this identity; --sense wires that
+supervisor to the local Sense daemon and Orb.`,
 
   "agent inbox": `cogx agent inbox --agent <slug> [--limit N] [--json]
 
@@ -2406,12 +2545,17 @@ Start options:
   --preview            include message content in desktop notifications
   --no-preview         hide message content (default)
   --webhook URL|none   POST message events to a wake integration
+  --sense              notify Sense + raise the local Orb (127.0.0.1:48200)
+  --sense-url URL      override the Sense daemon base URL
+  --no-sense           disable a previously configured Sense output
   --replay             notify existing unread messages again
   --force              restart an already-running supervisor
 
-Logs are private NDJSON under ~/.icog/notifications/<slug>/. Notification
-delivery never acknowledges PMP receipts. Use "notify test" to verify the
-configured desktop and webhook outputs without creating a PMP message.`,
+Logs are private NDJSON under ~/.icog/notifications/<slug>/. Sense receives
+redacted notification metadata and applies its own attention policy; message
+content is included only with --preview. Notification delivery never
+acknowledges PMP receipts. Use "notify test" to verify configured outputs
+without creating a PMP message.`,
 
   "agent send": `cogx agent send <recipient> <message> --agent <sender> --context <why>
 
@@ -2536,9 +2680,9 @@ ${c.bold("Cognition:")}
 
 ${c.bold("Multi-agent:")}
   agent list | status        inspect identities without global switching
-  agent activate <slug>      select identity; --notify starts its supervisor
+  agent activate <slug>      select identity; --notify/--sense starts awareness
   agent inbox | wait | watch addressed agent messaging + notifications
-  agent notify               background desktop/webhook notification manager
+  agent notify               background desktop/webhook/Sense notification manager
   agent handoff              transfer a task with memory references
   team list | create         manage collaboration teams
   orchestrate <goal>         dispatch one goal/thread to agents or a team
@@ -2583,6 +2727,7 @@ ${c.bold("Env:")}
   ICOG_API_URL               override API endpoint (default: ${API_URL})
   ICOG_PROJECT               default project tag
   COGX_AGENT_SLUG            shell/session-scoped agent identity
+  COGX_SENSE_URL             Sense daemon base URL (default: ${DEFAULT_SENSE_URL})
   ICOG_TIMEOUT_MS            request timeout in ms (default: ${DEFAULT_TIMEOUT_MS})
   NO_COLOR=1                 disable color output
 

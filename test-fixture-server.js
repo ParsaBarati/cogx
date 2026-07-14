@@ -91,6 +91,24 @@ http.createServer((req, res) => {
     if (req.method === "POST" && url.pathname === "/notify-hook") {
       return send(res, 200, { received: true });
     }
+    if (req.method === "POST" && url.pathname === "/pmp/events") {
+      return send(res, 200, { ok: true, event_id: 42, decision: "raise_hand", orb_notified: true, duplicate: false });
+    }
+    if (req.method === "POST" && url.pathname === "/legacy/pmp/events") {
+      return send(res, 404, { detail: "not found" });
+    }
+    if (req.method === "POST" && url.pathname === "/legacy/events") {
+      return send(res, 200, { ok: true, id: 44 });
+    }
+    if (req.method === "POST" && url.pathname === "/legacy/orb/state") {
+      return send(res, 200, { ok: true, clients: 1 });
+    }
+    if (req.method === "POST" && url.pathname === "/events") {
+      return send(res, 200, { ok: true, id: 43 });
+    }
+    if (req.method === "POST" && url.pathname === "/orb/state") {
+      return send(res, 200, { ok: true, clients: 1 });
+    }
     if (req.method === "GET" && url.pathname === "/api/teams") return send(res, 200, teams);
     if (req.method === "POST" && url.pathname === "/api/teams") {
       const team = { id: randomUUID(), name: body.name, owner_user_id: "test", member_slugs: body.member_slugs, created_at: new Date().toISOString(), updated_at: new Date().toISOString() };

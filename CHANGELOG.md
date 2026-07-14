@@ -2,6 +2,17 @@
 
 All notable changes to `cogx` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [1.5.0] — 2026-07-14
+
+### Added
+- `--sense` makes the PMP notification supervisor a native Sense/Orb awareness source instead of requiring a generic webhook.
+- `--sense-url` supports an alternate Sense daemon, while `COGX_SENSE_URL` provides a host-level default and `--no-sense` disables persisted Sense delivery.
+- Native Sense delivery records a privacy-safe local event, applies Sense quiet-hours/attention policy, and raises the Orb. Older Sense daemons use a metadata-only `/events` + `/orb/state` compatibility path.
+
+### Security
+- CogX excludes PMP content from Sense delivery unless `--preview` is explicit. Sense redacts preview text before persistence.
+- Plain HTTP Sense URLs are restricted to loopback; remote Sense hosts require HTTPS. CognitiveX credentials are never forwarded.
+
 ## [1.4.0] — 2026-07-14
 
 ### Added
