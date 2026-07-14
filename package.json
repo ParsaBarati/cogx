@@ -41,9 +41,9 @@
   "homepage": "https://i.cognitivx.io/install",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Lexaplus/cogx.git"
+    "url": "git+https://github.com/ParsaBarati/cogx.git"
   },
   "bugs": {
-    "url": "https://github.com/Lexaplus/cogx/issues"
+    "url": "https://github.com/ParsaBarati/cogx/issues"
   }
 }

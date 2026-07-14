@@ -33,7 +33,7 @@ Requires Node.js 18 or newer.
 **From GitHub** (works today, no npm publish needed):
 
 ```bash
-npm install -g github:Lexaplus/cogx
+npm install -g github:ParsaBarati/cogx
 ```
 
 **From npm:**
@@ -45,7 +45,7 @@ npm install -g @cognitivx/cli
 **One-off** without installing globally:
 
 ```bash
-npx github:Lexaplus/cogx talk "what did we ship today"
+npx github:ParsaBarati/cogx talk "what did we ship today"
 ```
 
 Verify the install:
