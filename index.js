@@ -13,7 +13,7 @@ if (typeof fetch !== "function") {
   process.exit(1);
 }
 
-const VERSION = "1.3.0";
+const VERSION = "1.3.1";
 const API_URL = (process.env.ICOG_API_URL || "https://api.cognitivx.io").replace(/\/$/, "");
 const ICOG_DIR = path.join(os.homedir(), ".icog");
 const CREDS_PATH = path.join(ICOG_DIR, "credentials.json");
@@ -1130,30 +1130,184 @@ function cmdAgentStatus(_args, flags) {
   } else console.log(c.dim("No agent identity selected."));
 }
 
+function agentInboxRoute(slug, { cursor = "", limit = 100 } = {}) {
+  const query = new URLSearchParams();
+  if (cursor) query.set("cursor", cursor);
+  if (limit) query.set("limit", String(limit));
+  const suffix = query.toString() ? `?${query}` : "";
+  return `/api/agents/${encodeURIComponent(slug)}/inbox${suffix}`;
+}
+
+async function fetchAgentInbox(slug, { retries = true, ...options } = {}) {
+  return httpRequest("GET", agentInboxRoute(slug, options), {
+    retries,
+    timeoutMs: Math.min(DEFAULT_TIMEOUT_MS, 10000),
+  });
+}
+
+function unreadAgentMessages(inbox) {
+  return (inbox.messages || []).filter((message) =>
+    !["acknowledged", "read"].includes(String(message.delivery_status || "").toLowerCase())
+  );
+}
+
+async function fetchUnreadAgentInbox(slug) {
+  let inbox = await fetchAgentInbox(slug, { limit: 200, retries: false });
+  const unread = unreadAgentMessages(inbox);
+  let cursor = inbox.cursor;
+  let hasMore = inbox.has_more;
+  let pages = 1;
+
+  // The inbox is ordered by recency and also includes acknowledged messages.
+  // Follow older pages when the authoritative unread_count says unread work is
+  // hidden behind recent history. Bound the scan to avoid an unbounded poll.
+  while (unread.length < Number(inbox.unread_count || 0) && hasMore && cursor && pages < 25) {
+    const page = await fetchAgentInbox(slug, { cursor, limit: 200, retries: false });
+    unread.push(...unreadAgentMessages(page));
+    cursor = page.cursor;
+    hasMore = page.has_more;
+    pages++;
+  }
+  return { ...inbox, messages: unread, unread_scan_truncated: hasMore && pages >= 25 };
+}
+
+function printAgentMessage(message) {
+  console.log(`${c.cyan(message.id.slice(0, 8))} ${c.bold(message.sender_slug || "unknown")} ${c.dim(`[${message.message_kind}] ${message.delivery_status}`)}`);
+  console.log(`  ${message.content}`);
+  console.log(c.dim(`  why: ${message.context_explanation}`));
+}
+
+function numericFlag(flags, name, fallback, { min = 0 } = {}) {
+  if (flags[name] === undefined) return fallback;
+  const value = Number(flags[name]);
+  if (!Number.isFinite(value) || value < min) {
+    die(`--${name} must be a number >= ${min}`);
+  }
+  return value;
+}
+
 async function cmdAgentActivate(args) {
   const slug = normalizeAgentSlug(args[0]);
   if (!slug) die("usage: cogx agent activate <slug>");
   await httpRequest("GET", `/api/agents/${encodeURIComponent(slug)}`);
+  let unreadCount = null;
+  let inboxAvailable = true;
+  try {
+    const inbox = await fetchAgentInbox(slug, { limit: 1 });
+    unreadCount = Number(inbox.unread_count || 0);
+  } catch {
+    inboxAvailable = false;
+  }
   if (JSON_MODE) {
-    console.log(JSON.stringify({ ok: true, agent_slug: slug, shell: `export COGX_AGENT_SLUG=${slug}` }));
+    console.log(JSON.stringify({
+      ok: true,
+      agent_slug: slug,
+      shell: `export COGX_AGENT_SLUG=${slug}`,
+      unread_count: unreadCount,
+      inbox_available: inboxAvailable,
+    }));
     return;
   }
   console.log(`export COGX_AGENT_SLUG=${slug}`);
+  // Keep notices on stderr so eval "$(cogx agent activate ...)" receives
+  // only valid shell syntax on stdout.
+  if (!inboxAvailable) {
+    console.error(c.yellow(`warning: activated ${slug}, but the inbox check was unavailable`));
+  } else if (unreadCount > 0) {
+    console.error(c.yellow(`⚑ ${slug} has ${unreadCount} unread message${unreadCount === 1 ? "" : "s"}. Run: cogx agent inbox --agent ${slug}`));
+  }
 }
 
 async function cmdAgentInbox(_args, flags) {
   const slug = resolveAgentSlug(flags, { required: true });
-  const query = new URLSearchParams();
-  if (flags.cursor) query.set("cursor", flags.cursor);
-  if (flags.limit) query.set("limit", flags.limit);
-  const suffix = query.toString() ? `?${query}` : "";
-  const inbox = await httpRequest("GET", `/api/agents/${encodeURIComponent(slug)}/inbox${suffix}`);
+  const inbox = await fetchAgentInbox(slug, { cursor: flags.cursor, limit: flags.limit || 50 });
   if (JSON_MODE) { console.log(JSON.stringify({ ok: true, ...inbox })); return; }
   console.log(`${c.bold(slug)} inbox — ${inbox.unread_count || 0} unread`);
-  for (const message of inbox.messages || []) {
-    console.log(`${c.cyan(message.id.slice(0, 8))} ${c.bold(message.sender_slug || "unknown")} ${c.dim(`[${message.message_kind}] ${message.delivery_status}`)}`);
-    console.log(`  ${message.content}`);
-    console.log(c.dim(`  why: ${message.context_explanation}`));
+  for (const message of inbox.messages || []) printAgentMessage(message);
+}
+
+async function cmdAgentWait(_args, flags) {
+  const slug = resolveAgentSlug(flags, { required: true });
+  const intervalSeconds = numericFlag(flags, "interval", 2, { min: 0.05 });
+  const timeoutSeconds = numericFlag(flags, "timeout", 300, { min: 0 });
+  const deadline = timeoutSeconds === 0 ? Infinity : Date.now() + timeoutSeconds * 1000;
+
+  if (!JSON_MODE) {
+    console.error(c.dim(`Waiting for ${slug} inbox (poll ${intervalSeconds}s${timeoutSeconds ? `, timeout ${timeoutSeconds}s` : ", no timeout"})…`));
+  }
+
+  while (Date.now() < deadline) {
+    const inbox = await fetchUnreadAgentInbox(slug);
+    const unread = unreadAgentMessages(inbox);
+    if (Number(inbox.unread_count || 0) > 0 && unread.length > 0) {
+      if (JSON_MODE) {
+        console.log(JSON.stringify({
+          ok: true,
+          event: "message",
+          agent_slug: slug,
+          unread_count: Number(inbox.unread_count || unread.length),
+          messages: unread,
+        }));
+      } else {
+        console.log(`${c.bold(slug)} inbox — ${inbox.unread_count} unread`);
+        for (const message of unread) printAgentMessage(message);
+      }
+      return;
+    }
+    await sleep(Math.min(intervalSeconds * 1000, Math.max(0, deadline - Date.now())));
+  }
+
+  if (JSON_MODE) {
+    console.log(JSON.stringify({ ok: false, event: "timeout", agent_slug: slug, timed_out: true }));
+  } else {
+    console.error(c.yellow(`No unread messages for ${slug} within ${timeoutSeconds}s.`));
+  }
+  process.exitCode = 2;
+}
+
+async function cmdAgentWatch(_args, flags) {
+  const slug = resolveAgentSlug(flags, { required: true });
+  const intervalSeconds = numericFlag(flags, "interval", 2, { min: 0.05 });
+  const timeoutSeconds = numericFlag(flags, "timeout", 0, { min: 0 });
+  const deadline = timeoutSeconds === 0 ? Infinity : Date.now() + timeoutSeconds * 1000;
+  const seen = new Set();
+
+  if (!JSON_MODE) {
+    console.error(c.dim(`Watching ${slug} inbox every ${intervalSeconds}s. Press Ctrl+C to stop.`));
+  }
+
+  while (Date.now() < deadline) {
+    try {
+      const inbox = await fetchUnreadAgentInbox(slug);
+      for (const message of unreadAgentMessages(inbox)) {
+        if (seen.has(message.id)) continue;
+        seen.add(message.id);
+        if (JSON_MODE) {
+          console.log(JSON.stringify({
+            ok: true,
+            event: "message",
+            agent_slug: slug,
+            unread_count: Number(inbox.unread_count || 0),
+            message,
+          }));
+        } else {
+          printAgentMessage(message);
+        }
+      }
+    } catch (error) {
+      if (JSON_MODE) {
+        console.log(JSON.stringify({ ok: false, event: "poll_error", agent_slug: slug, error: error.message }));
+      } else {
+        console.error(c.yellow(`inbox poll failed: ${error.message}`));
+      }
+    }
+    await sleep(Math.min(intervalSeconds * 1000, Math.max(0, deadline - Date.now())));
+  }
+
+  if (JSON_MODE) {
+    console.log(JSON.stringify({ ok: true, event: "timeout", agent_slug: slug }));
+  } else if (timeoutSeconds) {
+    console.error(c.dim(`Stopped watching ${slug} after ${timeoutSeconds}s.`));
   }
 }
 
@@ -1831,6 +1985,16 @@ it never mutates another terminal or agent session.`,
 
 Read direct and team messages for one agent.`,
 
+  "agent wait": `cogx agent wait --agent <slug> [--timeout SECONDS] [--interval SECONDS] [--json]
+
+Block until an unread message arrives. Defaults to a 300-second timeout.
+Use --timeout 0 to wait indefinitely. A timeout exits with status 2.`,
+
+  "agent watch": `cogx agent watch --agent <slug> [--interval SECONDS] [--timeout SECONDS] [--json]
+
+Continuously print newly observed unread messages without acknowledging them.
+Defaults to a 2-second poll interval and no timeout. JSON output is NDJSON.`,
+
   "agent send": `cogx agent send <recipient> <message> --agent <sender> --context <why>
 
 Send an attributed agent message. Optional: --kind, --thread, --reply-to,
@@ -1955,7 +2119,7 @@ ${c.bold("Cognition:")}
 ${c.bold("Multi-agent:")}
   agent list | status        inspect identities without global switching
   agent activate <slug>      print a shell-session identity export
-  agent inbox | send | ack   addressed agent messaging
+  agent inbox | wait | watch addressed agent messaging + notifications
   agent handoff              transfer a task with memory references
   team list | create         manage collaboration teams
   orchestrate <goal>         dispatch one goal/thread to agents or a team
@@ -2048,6 +2212,8 @@ const COMMANDS = {
       "status":   cmdAgentStatus,
       "activate": cmdAgentActivate,
       "inbox":    cmdAgentInbox,
+      "wait":     cmdAgentWait,
+      "watch":    cmdAgentWatch,
       "send":     cmdAgentSend,
       "ack":      cmdAgentAck,
       "thread":   cmdAgentThread,

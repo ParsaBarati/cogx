@@ -34,6 +34,10 @@ function messageResponse(sender, body) {
     delivered_at: null,
     read_at: null,
   };
+  Object.defineProperty(message, "_recipient_slug", {
+    value: body.recipient_slug || null,
+    enumerable: false,
+  });
   messages.push(message);
   return message;
 }
@@ -109,10 +113,18 @@ http.createServer((req, res) => {
     }
     const inboxMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/inbox$/);
     if (req.method === "GET" && inboxMatch) {
-      return send(res, 200, { slug: inboxMatch[1], unread_count: messages.length, messages, has_more: false, cursor: null });
+      const addressed = messages.filter((item) => item._recipient_slug === inboxMatch[1]);
+      const unread = addressed.filter((item) => item.delivery_status === "unread");
+      return send(res, 200, { slug: inboxMatch[1], unread_count: unread.length, messages: addressed, has_more: false, cursor: null });
     }
     const ackMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/inbox\/([^/]+)\/ack$/);
-    if (req.method === "POST" && ackMatch) return send(res, 200, { message_id: ackMatch[2], delivery_status: "acknowledged" });
+    if (req.method === "POST" && ackMatch) {
+      const message = messages.find((item) => item.id === ackMatch[2] && item._recipient_slug === ackMatch[1]);
+      if (!message) return send(res, 404, { detail: "not found" });
+      message.delivery_status = "acknowledged";
+      message.read_at = new Date().toISOString();
+      return send(res, 200, { message_id: ackMatch[2], delivery_status: "acknowledged" });
+    }
     const threadMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/threads\/([^/]+)$/);
     if (req.method === "GET" && threadMatch) {
       return send(res, 200, { thread_id: threadMatch[2], messages: messages.filter((item) => item.thread_id === threadMatch[2]) });

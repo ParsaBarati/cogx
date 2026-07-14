@@ -162,6 +162,20 @@ eval "$(cogx agent activate Aporta)"
 cogx agent status
 ```
 
+Activation checks the selected agent's inbox and prints any unread notice to
+stderr, keeping stdout safe for `eval`. To block until work arrives or keep a
+terminal watcher running:
+
+```bash
+cogx agent wait --agent Aporta                 # waits up to 5 minutes
+cogx agent wait --agent Aporta --timeout 0     # waits indefinitely
+cogx agent watch --agent Aporta                # streams new unread messages
+cogx agent watch --agent Aporta --json         # NDJSON for a supervisor
+```
+
+Watching does not acknowledge messages; receipt state changes only through
+`cogx agent ack`.
+
 Coordinate through addressed messages and durable handoffs:
 
 ```bash
@@ -297,7 +311,8 @@ cogx recall "deploy steps" --json | jq '.memories[0].text'
 | `cogx save-session <summary>` | Episodic session summary |
 | `cogx identify <name>` | Register agent identity |
 | `cogx agent list` / `status` / `activate` | Manage session-safe identities |
-| `cogx agent inbox` / `send` / `ack` / `thread` | Agent messaging |
+| `cogx agent inbox` / `wait` / `watch` | Inbox and delivery awareness |
+| `cogx agent send` / `ack` / `thread` | Agent messaging and receipts |
 | `cogx agent handoff` | Transfer a task with evidence |
 | `cogx team list` / `create` / `set-members` / `delete` | Manage agent teams |
 | `cogx orchestrate <goal>` | Dispatch a shared thread to agents or a team |

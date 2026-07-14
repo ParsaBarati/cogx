@@ -258,6 +258,63 @@ test("orchestrate dispatches one shared thread with per-agent tasks", () => {
   assert("automa task", sent[1].body.content === "map automation");
 });
 
+test("agent wait/watch help documents delivery awareness", () => {
+  const waitHelp = run(["agent", "wait", "--help"]);
+  const watchHelp = run(["agent", "watch", "--help"]);
+  assert("wait help status", waitHelp.status === 0, waitHelp.stderr);
+  assert("wait help timeout", waitHelp.stdout.includes("--timeout"));
+  assert("watch help status", watchHelp.status === 0, watchHelp.stderr);
+  assert("watch help NDJSON", watchHelp.stdout.includes("NDJSON"));
+});
+
+test("agent activate keeps stdout eval-safe and reports unread on stderr", () => {
+  const sent = run([
+    "agent", "send", "Aporta", "Review the PMP notification release",
+    "--agent", "Abarcode", "--context", "CLI delivery-awareness test", "--json",
+  ]);
+  assert("notification seed sent", sent.status === 0, sent.stderr || sent.stdout);
+
+  const activated = run(["agent", "activate", "Aporta"]);
+  assert("activate status", activated.status === 0, activated.stderr);
+  assert("activate stdout is export only", activated.stdout.trim() === "export COGX_AGENT_SLUG=aporta", activated.stdout);
+  assert("activate stderr has unread notice", /aporta has 1 unread message/.test(activated.stderr), activated.stderr);
+
+  const json = run(["agent", "activate", "Aporta", "--json"]);
+  const parsed = JSON.parse(json.stdout.trim());
+  assert("activate json unread count", parsed.unread_count === 1, json.stdout);
+  assert("activate json inbox available", parsed.inbox_available === true, json.stdout);
+});
+
+test("agent wait returns the current unread message", () => {
+  const r = run(["agent", "wait", "--agent", "Aporta", "--timeout", "0.2", "--interval", "0.05", "--json"]);
+  assert("wait status", r.status === 0, r.stderr || r.stdout);
+  const parsed = JSON.parse(r.stdout.trim());
+  assert("wait event message", parsed.event === "message", r.stdout);
+  assert("wait recipient count", parsed.unread_count === 1, r.stdout);
+  assert("wait returns messages", parsed.messages.length === 1, r.stdout);
+});
+
+test("agent watch emits each unread message once", () => {
+  const r = run(["agent", "watch", "--agent", "Aporta", "--timeout", "0.16", "--interval", "0.05", "--json"]);
+  assert("watch status", r.status === 0, r.stderr || r.stdout);
+  const events = r.stdout.trim().split("\n").filter(Boolean).map(JSON.parse);
+  const messageEvents = events.filter((item) => item.event === "message");
+  assert("watch emits one message", messageEvents.length === 1, r.stdout);
+  assert("watch ends on timeout", events.at(-1).event === "timeout", r.stdout);
+});
+
+test("agent wait times out with status 2 after message acknowledgement", () => {
+  const inbox = run(["agent", "inbox", "--agent", "Aporta", "--json"]);
+  const messageId = JSON.parse(inbox.stdout.trim()).messages[0].id;
+  const ack = run(["agent", "ack", messageId, "--agent", "Aporta", "--json"]);
+  assert("wait timeout seed acknowledged", ack.status === 0, ack.stderr || ack.stdout);
+
+  const r = run(["agent", "wait", "--agent", "Aporta", "--timeout", "0.12", "--interval", "0.05", "--json"]);
+  assert("wait timeout status", r.status === 2, `status=${r.status} stdout=${r.stdout} stderr=${r.stderr}`);
+  const parsed = JSON.parse(r.stdout.trim());
+  assert("wait timeout event", parsed.event === "timeout" && parsed.timed_out === true, r.stdout);
+});
+
 // ---------------------------------------------------------------------------
 // Report
 // ---------------------------------------------------------------------------

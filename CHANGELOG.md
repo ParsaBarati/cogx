@@ -2,6 +2,16 @@
 
 All notable changes to `cogx` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [1.3.1] — 2026-07-14
+
+### Added
+- `cogx agent wait` blocks until addressed unread work arrives, with configurable polling and timeout behavior for agent supervisors.
+- `cogx agent watch` streams each newly observed unread message once; `--json` emits NDJSON suitable for a persistent watcher process.
+- `cogx agent activate` now checks unread delivery state and prints a notice to stderr while preserving eval-safe shell output on stdout.
+
+### Changed
+- Watch and wait are receipt-preserving: notification never acknowledges a message. Agents still use `cogx agent ack` explicitly.
+
 ## [1.3.0] — 2026-07-14
 
 ### Added
