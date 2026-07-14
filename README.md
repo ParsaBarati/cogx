@@ -1,9 +1,9 @@
 # cogx
 
-The CogX CLI — recall, remember, and talk to your personal AI from any terminal.
+The CogX CLI — a command-line client for the Persistent Memory Protocol (PMP).
 
 ```bash
-npm install -g cogx
+npm install -g @cognitivx/cli
 cogx auth login
 cogx talk "what did we decide about auth last week"
 ```
@@ -14,7 +14,12 @@ Pure Node.js, zero dependencies. Works the same on macOS, Linux, and Windows.
 
 ## Why
 
-iCog is a persistent cross-session memory layer. The `cogx` CLI gives you (and your coding agents) direct access to it from the terminal — without needing the MCP, without leaving the shell, scriptable end-to-end.
+iCog is a persistent cross-session memory layer. The `cogx` CLI gives you (and your coding agents) direct access to it from the terminal — without leaving the shell, scriptable end-to-end.
+
+This contract is the **Persistent Memory Protocol (PMP)**: durable agent identity,
+memory, provenance, sharing, messaging, and orchestration across independent
+sessions. PMP complements MCP: MCP connects a model to tools during a run; PMP
+preserves identity and knowledge across runs.
 
 - **For humans:** quickly recall past decisions, jot down a thought, or ask iCog for perspective.
 - **For agents:** call `cogx --json` from any tool that can run a shell command. Pipe content in, get JSON out, no SDK required.
@@ -126,6 +131,55 @@ you ❯ /quit
 ```
 
 History is saved to `~/.icog/history` and loaded across sessions (up-arrow recalls).
+
+---
+
+## PMP multi-agent orchestration
+
+Register each participant once. Agent type is a memory-policy class; put the
+agent's job in its description and task.
+
+```bash
+cogx identify Aporta --type tool --description "Aira architecture agent"
+cogx identify Abarcode --type tool --description "Barcode ERP agent"
+cogx identify Automa --type tool --description "Automation agent"
+```
+
+Once more than one identity exists, CogX refuses ambiguous agent operations.
+Select the identity per command (safe in any runner):
+
+```bash
+cogx recall "current architecture decisions" --agent Aporta
+cogx remember "Barcode owns invoice authority" --agent Abarcode \
+  --share-with Aporta,Automa
+cogx talk "check this boundary" --agent Automa --task "mapping integrations" --scope strict
+```
+
+Or activate it only in the current shell—never globally across sessions:
+
+```bash
+eval "$(cogx agent activate Aporta)"
+cogx agent status
+```
+
+Coordinate through addressed messages and durable handoffs:
+
+```bash
+cogx agent send Abarcode "Confirm invoice ownership" \
+  --agent Aporta --context "Aira architecture boundary review"
+cogx agent inbox --agent Abarcode
+cogx agent handoff Automa "Implement the verified connector boundary" \
+  --agent Abarcode --context "ERP contract is now confirmed"
+```
+
+Create a team or dispatch one shared thread with individual assignments:
+
+```bash
+cogx team create aira-ecosystem --members Aporta,Abarcode,Automa
+cogx orchestrate "Map the end-to-end quote-to-cash flow" --agent Aporta \
+  --agents Abarcode,Automa \
+  --tasks '{"abarcode":"map ERP authority","automa":"map automations"}'
+```
 
 ---
 
@@ -242,6 +296,11 @@ cogx recall "deploy steps" --json | jq '.memories[0].text'
 | `cogx dream` / `dream-status` | Trigger / monitor consolidation |
 | `cogx save-session <summary>` | Episodic session summary |
 | `cogx identify <name>` | Register agent identity |
+| `cogx agent list` / `status` / `activate` | Manage session-safe identities |
+| `cogx agent inbox` / `send` / `ack` / `thread` | Agent messaging |
+| `cogx agent handoff` | Transfer a task with evidence |
+| `cogx team list` / `create` / `set-members` / `delete` | Manage agent teams |
+| `cogx orchestrate <goal>` | Dispatch a shared thread to agents or a team |
 | `cogx search <query>` | Web search via iCog (Tavily) |
 
 ### Global flags
@@ -250,6 +309,8 @@ cogx recall "deploy steps" --json | jq '.memories[0].text'
 |---|---|
 | `--json`, `-j` | Emit JSON output |
 | `--project <name>`, `-p` | Tag content with `[Project: <name>] ` |
+| `--agent <slug>` | Attribute this operation to one agent |
+| `--as-user` | Explicitly run without agent attribution |
 | `--type <t>`, `-t` | Memory type filter |
 | `--limit <n>`, `-l` | Result count |
 | `--help`, `-h` | Show help (or per-command: `cogx remember --help`) |
@@ -262,6 +323,7 @@ cogx recall "deploy steps" --json | jq '.memories[0].text'
 | `ICOG_API_KEY` | Override stored credentials | — |
 | `ICOG_API_URL` | Override API endpoint | `https://i.cognitivx.io` |
 | `ICOG_PROJECT` | Default project tag | — |
+| `COGX_AGENT_SLUG` | Current shell/session agent identity | — |
 | `ICOG_TIMEOUT_MS` | Request timeout | `60000` |
 | `NO_COLOR` | Disable color output | — |
 
@@ -280,7 +342,7 @@ The CLI retries transient failures (502/503/504, network errors) with exponentia
 
 ## Privacy
 
-The CLI talks to `https://i.cognitivx.io` over HTTPS. Same API as the iCog web app and MCP — your memory, your data, the same on every device.
+The CLI talks to `https://api.cognitivx.io` over HTTPS. Same API as the iCog web app and MCP — your memory, your data, the same on every device.
 
 ---
 

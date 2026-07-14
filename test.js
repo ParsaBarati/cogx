@@ -2,12 +2,28 @@
 // Run: node test.js
 "use strict";
 
-const { spawnSync } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 
 const CLI = path.join(__dirname, "index.js");
-const env = { ...process.env, NO_COLOR: "1", ICOG_API_KEY: "test_dummy_key" };
+const fixtureHome = fs.mkdtempSync(require("os").tmpdir() + "/cogx-fixture-");
+const fixtureLog = path.join(fixtureHome, "requests.jsonl");
+fs.writeFileSync(fixtureLog, "");
+const fixturePort = 40000 + (process.pid % 20000);
+const fixtureServer = spawn(process.execPath, [path.join(__dirname, "test-fixture-server.js")], {
+  env: { ...process.env, COGX_TEST_PORT: String(fixturePort), COGX_TEST_LOG: fixtureLog },
+  stdio: "ignore",
+});
+Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+const env = {
+  ...process.env,
+  NO_COLOR: "1",
+  ICOG_API_KEY: "test_dummy_key",
+  ICOG_API_URL: `http://127.0.0.1:${fixturePort}`,
+  HOME: fixtureHome,
+  USERPROFILE: fixtureHome,
+};
 
 let pass = 0;
 let fail = 0;
@@ -38,6 +54,10 @@ function test(name, fn) {
     failures.push({ name, detail: `threw: ${e.message}` });
     process.stdout.write("E");
   }
+}
+
+function requests() {
+  return fs.readFileSync(fixtureLog, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +198,66 @@ test("argv: short flag -v prints version", () => {
   assert("short -v is semver", /^\d+\.\d+\.\d+/.test(r.stdout.trim()));
 });
 
+test("multiple agents require explicit session identity", () => {
+  assert("identify aporta", run(["identify", "Aporta", "--json"]).status === 0);
+  assert("identify abarcode", run(["identify", "Abarcode", "--json"]).status === 0);
+  const ambiguous = run(["remember", "unsafe", "--json"]);
+  assert("ambiguous identity rejected", ambiguous.status === 1, ambiguous.stdout);
+  const parsed = JSON.parse(ambiguous.stdout.trim());
+  assert("ambiguous error code", parsed.code === "agent_identity_ambiguous");
+});
+
+test("--as-user overrides a session identity without leaking attribution", () => {
+  const before = requests().length;
+  const r = run(["remember", "human note", "--as-user", "--json"], {
+    env: { ...env, COGX_AGENT_SLUG: "Automa" },
+  });
+  assert("as-user remember status", r.status === 0, r.stderr || r.stdout);
+  const req = requests().slice(before)[0];
+  assert("as-user omits agent slug", req.body.agent_slug === undefined, JSON.stringify(req));
+});
+
+test("remember sends agent attribution and shares explicitly", () => {
+  const before = requests().length;
+  const r = run(["remember", "shared decision", "--agent", "Abarcode", "--share-with", "Aporta", "--json"]);
+  assert("attributed remember status", r.status === 0, r.stderr || r.stdout);
+  const parsed = JSON.parse(r.stdout.trim());
+  assert("remember agent slug", parsed.agent_slug === "abarcode");
+  assert("remember shared target", parsed.shared_with[0] === "aporta");
+  const delta = requests().slice(before);
+  assert("remember payload attributed", delta[0].body.agent_slug === "abarcode", JSON.stringify(delta));
+  assert("share actor attributed", delta[1].body.actor_agent_slug === "abarcode", JSON.stringify(delta));
+  assert("share target canonical", delta[1].body.target_agent_slug === "aporta", JSON.stringify(delta));
+});
+
+test("talk carries agent task and scope", () => {
+  const before = requests().length;
+  const r = run(["talk", "check architecture", "--agent", "Aporta", "--task", "coordinate Aira", "--scope", "strict", "--json"]);
+  assert("talk status", r.status === 0, r.stderr || r.stdout);
+  const req = requests().slice(before)[0];
+  assert("talk agent", req.body.agent_slug === "aporta");
+  assert("talk task", req.body.current_task === "coordinate Aira");
+  assert("talk scope", req.body.scope_mode === "strict");
+});
+
+test("orchestrate dispatches one shared thread with per-agent tasks", () => {
+  const before = requests().length;
+  const r = run([
+    "orchestrate", "Ship Aira integration",
+    "--agent", "Aporta",
+    "--agents", "Abarcode,Automa",
+    "--tasks", '{"abarcode":"map ERP","automa":"map automation"}',
+    "--json",
+  ]);
+  assert("orchestrate status", r.status === 0, r.stderr || r.stdout);
+  const parsed = JSON.parse(r.stdout.trim());
+  assert("orchestrate two dispatches", parsed.dispatched.length === 2);
+  const sent = requests().slice(before).filter((item) => item.path.endsWith("/message"));
+  assert("same thread", sent[0].body.thread_id === undefined && sent[1].body.thread_id === parsed.thread_id, JSON.stringify(sent));
+  assert("barcode task", sent[0].body.content === "map ERP");
+  assert("automa task", sent[1].body.content === "map automation");
+});
+
 // ---------------------------------------------------------------------------
 // Report
 // ---------------------------------------------------------------------------
@@ -185,9 +265,13 @@ test("argv: short flag -v prints version", () => {
 console.log("");
 console.log("");
 if (fail === 0) {
+  fixtureServer.kill();
+  fs.rmSync(fixtureHome, { recursive: true, force: true });
   console.log(`✓ all tests passed (${pass})`);
   process.exit(0);
 } else {
+  fixtureServer.kill();
+  fs.rmSync(fixtureHome, { recursive: true, force: true });
   console.log(`✗ ${fail} failure(s), ${pass} passed:`);
   for (const f of failures) console.log(`  - ${f.name}: ${f.detail}`);
   process.exit(1);

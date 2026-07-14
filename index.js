@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// cogx — CogX CLI. Pure Node.js, zero deps. Requires Node 18+.
+// cogx — Persistent Memory Protocol (PMP) CLI. Pure Node.js, zero deps. Requires Node 18+.
 "use strict";
 
 const fs = require("fs");
@@ -13,7 +13,7 @@ if (typeof fetch !== "function") {
   process.exit(1);
 }
 
-const VERSION = "1.2.0";
+const VERSION = "1.3.0";
 const API_URL = (process.env.ICOG_API_URL || "https://api.cognitivx.io").replace(/\/$/, "");
 const ICOG_DIR = path.join(os.homedir(), ".icog");
 const CREDS_PATH = path.join(ICOG_DIR, "credentials.json");
@@ -151,7 +151,7 @@ function parseArgs(argv) {
       if (eq >= 0) { flags[a.slice(2, eq)] = a.slice(eq + 1); continue; }
       const key = a.slice(2);
       const next = argv[i + 1];
-      if (["all", "deep", "force", "help", "json", "version"].includes(key)) flags[key] = true;
+      if (["all", "as-user", "deep", "force", "help", "json", "version"].includes(key)) flags[key] = true;
       else if (next !== undefined && !next.startsWith("-")) { flags[key] = next; i++; }
       else flags[key] = true;
     } else if (a.startsWith("-") && a.length > 1) {
@@ -193,6 +193,71 @@ function getApiKey() {
   return k;
 }
 
+function normalizeAgentSlug(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+}
+
+function savedAgentSlugs(creds = loadCreds()) {
+  return Object.keys(creds.agents || {}).sort();
+}
+
+function resolveAgentSlug(flags = {}, { required = false } = {}) {
+  if (flags["as-user"]) {
+    if (flags.agent) die("--agent and --as-user cannot be used together");
+    return "";
+  }
+  const explicit = flags.agent || process.env.COGX_AGENT_SLUG || process.env.ICOG_AGENT_SLUG;
+  if (explicit) return normalizeAgentSlug(explicit);
+
+  const creds = loadCreds();
+  const saved = savedAgentSlugs(creds);
+  if (saved.length > 1) {
+    die(
+      `agent identity is ambiguous (${saved.join(", ")}). ` +
+      "Pass --agent <slug>, set COGX_AGENT_SLUG, or pass --as-user for an unattributed user operation.",
+      1,
+      { agents: saved, code: "agent_identity_ambiguous" },
+    );
+  }
+  const fallback = normalizeAgentSlug(creds.agent_slug || saved[0] || "");
+  if (required && !fallback) {
+    die(
+      "agent identity required. Pass --agent <slug> or set COGX_AGENT_SLUG.",
+      1,
+      { code: "agent_identity_required" },
+    );
+  }
+  return fallback;
+}
+
+function saveAgentProfile(profile) {
+  const creds = loadCreds();
+  creds.agents = creds.agents || {};
+  creds.agents[profile.slug] = {
+    name: profile.name,
+    agent_type: profile.agent_type || "tool",
+    description: profile.description || "",
+    current_task: profile.current_task || "",
+  };
+  const saved = savedAgentSlugs(creds);
+  if (saved.length === 1) creds.agent_slug = saved[0];
+  else delete creds.agent_slug;
+  saveCreds(creds);
+  return saved;
+}
+
+function commaList(value) {
+  return String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 // ---------------------------------------------------------------------------
 // stdin
 // ---------------------------------------------------------------------------
@@ -214,9 +279,9 @@ async function readStdin() {
 const TRANSIENT_STATUS = new Set([502, 503, 504]);
 const RETRY_DELAYS_MS = [1000, 3000, 8000];
 
-async function httpRequest(method, route, { body, auth = true, timeoutMs = DEFAULT_TIMEOUT_MS, retries = true } = {}) {
+async function httpRequest(method, route, { body, auth = true, timeoutMs = DEFAULT_TIMEOUT_MS, retries = true, headers: extraHeaders = {} } = {}) {
   const url = API_URL + route;
-  const headers = { "Content-Type": "application/json", "User-Agent": `cogx/${VERSION}` };
+  const headers = { "Content-Type": "application/json", "User-Agent": `cogx/${VERSION}`, ...extraHeaders };
   if (auth) headers["X-API-Key"] = getApiKey();
   const opts = { method, headers };
   if (body !== undefined) opts.body = JSON.stringify(body);
@@ -737,6 +802,8 @@ async function cmdRecall(args, flags) {
   const limit = parseInt(flags.limit || "8", 10);
   const deep = !!flags.deep;
   const payload = { query, limit, deep };
+  const agentSlug = resolveAgentSlug(flags);
+  if (agentSlug) payload.agent_slug = agentSlug;
   if (flags.type) payload.memory_type = flags.type;
 
   if (deep) {
@@ -796,12 +863,15 @@ async function cmdRemember(args, flags) {
   content = tagWithProject(content, flags.project);
   const memType = flags.type || "semantic";
   const deep = !!flags.deep;
+  const agentSlug = resolveAgentSlug(flags);
+  const rememberBody = { content, memory_type: memType };
+  if (agentSlug) rememberBody.agent_slug = agentSlug;
 
   if (deep) {
     const events = [];
     let final = null;
     await httpStream("POST", "/api/consciousness/remember", {
-      body: { content, memory_type: memType, deep: true },
+      body: { ...rememberBody, deep: true },
       onEvent: ({ data }) => {
         if (!data || typeof data !== "object") return;
         events.push(data);
@@ -810,7 +880,13 @@ async function cmdRemember(args, flags) {
       },
     });
     final = final || {};
-    if (JSON_MODE) { console.log(JSON.stringify({ ok: true, deep: true, ...final, events })); return; }
+    const shares = final.memory_id
+      ? await shareRememberedMemory(final.memory_id, flags, agentSlug)
+      : [];
+    if (JSON_MODE) {
+      console.log(JSON.stringify({ ok: true, deep: true, ...final, events, agent_slug: agentSlug || null, shared_with: shares }));
+      return;
+    }
     console.log("");
     const id = final.memory_id || "";
     if (final.action === "skip_duplicate") {
@@ -822,15 +898,32 @@ async function cmdRemember(args, flags) {
     } else {
       console.log(c.green("✓") + ` remembered (${id.slice(0, 8)}) [${memType}]`);
     }
+    if (shares.length) console.log(c.dim(`shared with ${shares.join(", ")}`));
     return;
   }
 
-  const result = await httpRequest("POST", "/api/consciousness/remember", { body: { content, memory_type: memType } });
+  const result = await httpRequest("POST", "/api/consciousness/remember", { body: rememberBody });
   const id = result.memory_id || result.id || "";
+  const shares = await shareRememberedMemory(id, flags, agentSlug);
   out(
-    `${c.green("✓")} remembered (${id.slice(0, 8)}) [${memType}]`,
-    { ok: true, memory_id: id, memory_type: memType }
+    `${c.green("✓")} remembered (${id.slice(0, 8)}) [${memType}]${shares.length ? ` → shared with ${shares.join(", ")}` : ""}`,
+    { ok: true, memory_id: id, memory_type: memType, agent_slug: agentSlug || null, shared_with: shares }
   );
+}
+
+async function shareRememberedMemory(memoryId, flags, agentSlug) {
+  const targets = commaList(flags["share-with"]);
+  if (!targets.length) return [];
+  if (!agentSlug) die("--share-with requires an attributed write; pass --agent <slug>");
+  const shared = [];
+  for (const target of targets) {
+    const r = await httpRequest("POST", `/api/memories/${encodeURIComponent(memoryId)}/share`, {
+      body: { target_agent_slug: normalizeAgentSlug(target), actor_agent_slug: agentSlug },
+      headers: { "Idempotency-Key": `cogx:${memoryId}:${normalizeAgentSlug(target)}` },
+    });
+    shared.push(r.shared_with || normalizeAgentSlug(target));
+  }
+  return shared;
 }
 
 async function cmdForget(args) {
@@ -857,11 +950,16 @@ async function cmdTalk(args, flags) {
 
   message = tagWithProject(message, flags.project);
   if (!JSON_MODE) process.stdout.write(c.dim("thinking... "));
-  const result = await httpRequest("POST", "/api/consciousness/talk", { body: { message } });
+  const body = { message };
+  const agentSlug = resolveAgentSlug(flags);
+  if (agentSlug) body.agent_slug = agentSlug;
+  if (flags.task) body.current_task = flags.task;
+  if (flags.scope) body.scope_mode = flags.scope;
+  const result = await httpRequest("POST", "/api/consciousness/talk", { body });
   if (!JSON_MODE) process.stdout.write("\r" + " ".repeat(20) + "\r");
 
   if (JSON_MODE) {
-    console.log(JSON.stringify({ ok: true, response: result.response || "", context_used: result.context_used || 0 }));
+    console.log(JSON.stringify({ ok: true, response: result.response || "", context_used: result.context_used || 0, agent_slug: agentSlug || null }));
     return;
   }
   console.log(renderMarkdown(result.response || ""));
@@ -954,7 +1052,10 @@ async function cmdSaveSession(args, flags) {
   if (project) parts.push(`Project: ${project}`);
   if (decisions) parts.push(`Key decisions: ${decisions}`);
 
-  const r = await httpRequest("POST", "/api/consciousness/remember", { body: { content: parts.join("\n"), memory_type: "episodic" } });
+  const body = { content: parts.join("\n"), memory_type: "episodic" };
+  const agentSlug = resolveAgentSlug(flags);
+  if (agentSlug) body.agent_slug = agentSlug;
+  const r = await httpRequest("POST", "/api/consciousness/remember", { body });
   await httpRequest("POST", "/api/consciousness/learn", { body: { outcome: "claude_code_session", metadata: { project, summary_length: summary.length } } });
   const id = r.memory_id || "";
   out(`${c.green("✓")} session saved (${id.slice(0, 8)})`, { ok: true, memory_id: id });
@@ -962,21 +1063,248 @@ async function cmdSaveSession(args, flags) {
 
 async function cmdIdentify(args, flags) {
   const name = args[0];
-  if (!name) die("usage: cogx identify <name> [--type coding|research|writing|...] [--description '...']");
+  if (!name) die("usage: cogx identify <name> [--type tool] [--description '...']");
   const r = await httpRequest("POST", "/api/agents/register", {
     body: {
       name,
-      agent_type: flags.type || "coding",
+      agent_type: flags.type || "tool",
       description: flags.description || "",
       current_task: flags.task || "",
     },
   });
-  const creds = loadCreds();
-  if (r.slug) creds.agent_slug = r.slug;
-  saveCreds(creds);
+  const saved = saveAgentProfile({
+    slug: r.slug,
+    name,
+    agent_type: r.agent_type || flags.type || "tool",
+    description: flags.description || "",
+    current_task: flags.task || "",
+  });
+  const activationHint = saved.length > 1
+    ? `\n  Multiple agents are registered. Use --agent ${r.slug} per command or set COGX_AGENT_SLUG=${r.slug} in this session.`
+    : "";
   out(
-    `${c.green("✓")} ${r.created ? "registered" : "updated"} as '${name}' (slug: ${r.slug || "?"})`,
-    { ok: true, name, slug: r.slug, created: !!r.created }
+    `${c.green("✓")} ${r.created ? "registered" : "updated"} as '${name}' (slug: ${r.slug || "?"})${activationHint}`,
+    { ok: true, name, slug: r.slug, agent_type: r.agent_type || "tool", created: !!r.created, registered_agents: saved }
+  );
+}
+
+async function cmdAgentList(_args, _flags) {
+  const agents = await httpRequest("GET", "/api/agents");
+  const creds = loadCreds();
+  creds.agents = {};
+  for (const agent of agents) {
+    creds.agents[agent.slug] = {
+      name: agent.name,
+      agent_type: agent.agent_type,
+      description: agent.description || "",
+      current_task: agent.current_task || "",
+    };
+  }
+  if (Object.keys(creds.agents).length > 1) delete creds.agent_slug;
+  saveCreds(creds);
+  if (JSON_MODE) {
+    console.log(JSON.stringify({ ok: true, agents }));
+    return;
+  }
+  if (!agents.length) { console.log(c.dim("No agents registered.")); return; }
+  for (const agent of agents) {
+    console.log(`${c.bold(agent.name)} ${c.dim(`(${agent.slug}, ${agent.agent_type})`)}`);
+    if (agent.current_task) console.log(`  ${agent.current_task}`);
+  }
+}
+
+function cmdAgentStatus(_args, flags) {
+  const creds = loadCreds();
+  const saved = savedAgentSlugs(creds);
+  const flagSlug = normalizeAgentSlug(flags.agent || "");
+  const envSlug = normalizeAgentSlug(process.env.COGX_AGENT_SLUG || process.env.ICOG_AGENT_SLUG || "");
+  const storedSlug = normalizeAgentSlug(creds.agent_slug || "");
+  const active = flagSlug || envSlug || (saved.length <= 1 ? storedSlug || saved[0] || "" : "");
+  const source = flagSlug ? "flag" : envSlug ? "environment" : active ? "stored" : saved.length > 1 ? "ambiguous" : "none";
+  const result = { ok: source !== "ambiguous", active_agent: active || null, source, registered_agents: saved };
+  if (JSON_MODE) { console.log(JSON.stringify(result)); return; }
+  if (active) console.log(`${c.green("✓")} active agent: ${c.bold(active)} ${c.dim(`(${source})`)}`);
+  else if (source === "ambiguous") {
+    console.log(c.yellow("Agent identity is ambiguous: ") + saved.join(", "));
+    console.log(c.dim("Use --agent <slug> or set COGX_AGENT_SLUG for this session."));
+  } else console.log(c.dim("No agent identity selected."));
+}
+
+async function cmdAgentActivate(args) {
+  const slug = normalizeAgentSlug(args[0]);
+  if (!slug) die("usage: cogx agent activate <slug>");
+  await httpRequest("GET", `/api/agents/${encodeURIComponent(slug)}`);
+  if (JSON_MODE) {
+    console.log(JSON.stringify({ ok: true, agent_slug: slug, shell: `export COGX_AGENT_SLUG=${slug}` }));
+    return;
+  }
+  console.log(`export COGX_AGENT_SLUG=${slug}`);
+}
+
+async function cmdAgentInbox(_args, flags) {
+  const slug = resolveAgentSlug(flags, { required: true });
+  const query = new URLSearchParams();
+  if (flags.cursor) query.set("cursor", flags.cursor);
+  if (flags.limit) query.set("limit", flags.limit);
+  const suffix = query.toString() ? `?${query}` : "";
+  const inbox = await httpRequest("GET", `/api/agents/${encodeURIComponent(slug)}/inbox${suffix}`);
+  if (JSON_MODE) { console.log(JSON.stringify({ ok: true, ...inbox })); return; }
+  console.log(`${c.bold(slug)} inbox — ${inbox.unread_count || 0} unread`);
+  for (const message of inbox.messages || []) {
+    console.log(`${c.cyan(message.id.slice(0, 8))} ${c.bold(message.sender_slug || "unknown")} ${c.dim(`[${message.message_kind}] ${message.delivery_status}`)}`);
+    console.log(`  ${message.content}`);
+    console.log(c.dim(`  why: ${message.context_explanation}`));
+  }
+}
+
+async function cmdAgentSend(args, flags) {
+  const sender = resolveAgentSlug(flags, { required: true });
+  const recipient = normalizeAgentSlug(args[0]);
+  const content = args.slice(1).join(" ").trim() || (await readStdin());
+  if (!recipient || !content) die("usage: cogx agent send <recipient> <message> --context <why>");
+  if (!flags.context) die("--context is required for agent messages");
+  const body = {
+    recipient_slug: recipient,
+    content,
+    context_explanation: flags.context,
+    message_kind: flags.kind || "message",
+    referenced_memory_ids: commaList(flags.memory),
+    referenced_message_ids: commaList(flags["referenced-message"]),
+  };
+  if (flags.thread) body.thread_id = flags.thread;
+  if (flags["reply-to"]) body.in_reply_to_message_id = flags["reply-to"];
+  const message = await httpRequest("POST", `/api/agents/${encodeURIComponent(sender)}/message`, { body });
+  out(
+    `${c.green("✓")} sent ${message.message_kind} to ${recipient} (${message.id.slice(0, 8)})`,
+    { ok: true, message },
+  );
+}
+
+async function cmdAgentAck(args, flags) {
+  const slug = resolveAgentSlug(flags, { required: true });
+  const messageId = args[0];
+  if (!messageId) die("usage: cogx agent ack <message-id>");
+  const result = await httpRequest("POST", `/api/agents/${encodeURIComponent(slug)}/inbox/${encodeURIComponent(messageId)}/ack`);
+  out(`${c.green("✓")} acknowledged ${messageId.slice(0, 8)}`, { ok: true, ...result });
+}
+
+async function cmdAgentThread(args, flags) {
+  const slug = resolveAgentSlug(flags, { required: true });
+  const threadId = args[0];
+  if (!threadId) die("usage: cogx agent thread <thread-id>");
+  const thread = await httpRequest(
+    "GET",
+    `/api/agents/${encodeURIComponent(slug)}/threads/${encodeURIComponent(threadId)}`,
+  );
+  if (JSON_MODE) { console.log(JSON.stringify({ ok: true, ...thread })); return; }
+  console.log(`${c.bold("Thread")} ${thread.thread_id}`);
+  for (const message of thread.messages || []) {
+    console.log(`${c.cyan(message.sender_slug || "unknown")} ${c.dim(`[${message.message_kind}]`)}`);
+    console.log(`  ${message.content}`);
+  }
+}
+
+async function cmdAgentHandoff(args, flags) {
+  const sender = resolveAgentSlug(flags, { required: true });
+  const recipient = normalizeAgentSlug(args[0]);
+  const summary = args.slice(1).join(" ").trim() || (await readStdin());
+  if (!recipient || !summary) die("usage: cogx agent handoff <recipient> <task-summary> --context <why>");
+  if (!flags.context) die("--context is required for handoffs");
+  const message = await httpRequest("POST", `/api/agents/${encodeURIComponent(sender)}/handoff`, {
+    body: {
+      to_slug: recipient,
+      active_task_summary: summary,
+      context_explanation: flags.context,
+      referenced_memory_ids: commaList(flags.memory),
+    },
+  });
+  out(`${c.green("✓")} handed off to ${recipient} (${message.id.slice(0, 8)})`, { ok: true, message });
+}
+
+async function cmdTeamList() {
+  const teams = await httpRequest("GET", "/api/teams");
+  if (JSON_MODE) { console.log(JSON.stringify({ ok: true, teams })); return; }
+  if (!teams.length) { console.log(c.dim("No agent teams.")); return; }
+  for (const team of teams) console.log(`${c.bold(team.name)} ${c.dim(team.id)}\n  ${team.member_slugs.join(", ") || "(empty)"}`);
+}
+
+async function cmdTeamCreate(args, flags) {
+  const name = args.join(" ").trim();
+  if (!name) die("usage: cogx team create <name> --members a,b,c");
+  const team = await httpRequest("POST", "/api/teams", {
+    body: { name, member_slugs: commaList(flags.members) },
+  });
+  out(`${c.green("✓")} team ${team.name}: ${team.member_slugs.join(", ")}`, { ok: true, team });
+}
+
+async function cmdTeamSetMembers(args, flags) {
+  const teamId = args[0];
+  if (!teamId) die("usage: cogx team set-members <team-id> --members a,b,c");
+  const team = await httpRequest("PUT", `/api/teams/${encodeURIComponent(teamId)}/members`, {
+    body: { member_slugs: commaList(flags.members) },
+  });
+  out(`${c.green("✓")} team ${team.name}: ${team.member_slugs.join(", ")}`, { ok: true, team });
+}
+
+async function cmdTeamDelete(args) {
+  const teamId = args[0];
+  if (!teamId) die("usage: cogx team delete <team-id>");
+  await httpRequest("DELETE", `/api/teams/${encodeURIComponent(teamId)}`);
+  out(`${c.green("✓")} deleted team ${teamId}`, { ok: true, team_id: teamId });
+}
+
+async function cmdOrchestrate(args, flags) {
+  const sender = resolveAgentSlug(flags, { required: true });
+  const goal = args.join(" ").trim() || (await readStdin());
+  if (!goal) die("usage: cogx orchestrate <goal> --agents a,b,c [--tasks '{\"a\":\"...\"}']");
+  const context = flags.context || `Multi-agent orchestration initiated by ${sender}`;
+  let tasks = {};
+  if (flags.tasks) {
+    try { tasks = JSON.parse(flags.tasks); }
+    catch { die("--tasks must be a JSON object keyed by agent slug"); }
+  }
+  const targets = commaList(flags.agents).map(normalizeAgentSlug);
+  let team = null;
+  if (flags.team) {
+    const teams = await httpRequest("GET", "/api/teams");
+    team = teams.find((candidate) => candidate.id === flags.team || candidate.name === flags.team);
+    if (!team) die(`team not found: ${flags.team}`);
+  }
+  if (!targets.length && !team) die("pass --agents a,b,c or --team <name-or-id>");
+
+  const dispatched = [];
+  let threadId = flags.thread || "";
+  if (team) {
+    const message = await httpRequest("POST", `/api/agents/${encodeURIComponent(sender)}/message`, {
+      body: {
+        recipient_team_id: team.id,
+        content: goal,
+        context_explanation: context,
+        message_kind: "question",
+        ...(threadId ? { thread_id: threadId } : {}),
+      },
+    });
+    threadId = message.thread_id;
+    dispatched.push({ recipient: `team:${team.name}`, message_id: message.id });
+  } else {
+    for (const target of targets) {
+      const task = tasks[target] || goal;
+      const message = await httpRequest("POST", `/api/agents/${encodeURIComponent(sender)}/message`, {
+        body: {
+          recipient_slug: target,
+          content: task,
+          context_explanation: `${context}\nShared goal: ${goal}`,
+          message_kind: "question",
+          ...(threadId ? { thread_id: threadId } : {}),
+        },
+      });
+      threadId = message.thread_id;
+      dispatched.push({ recipient: target, message_id: message.id });
+    }
+  }
+  out(
+    `${c.green("✓")} orchestration thread ${threadId}\n${dispatched.map((item) => `  → ${item.recipient} (${item.message_id.slice(0, 8)})`).join("\n")}`,
+    { ok: true, sender, goal, thread_id: threadId, dispatched },
   );
 }
 
@@ -1480,7 +1808,67 @@ Store an episodic memory summarizing the current work session.`,
 
 Register this agent with iCog so its talk() exchanges are attributed.
 
-Types: coding | research | writing | analysis | assistant | orchestrator | general`,
+Types: tool | persona | view | peer
+
+When multiple agents are registered, subsequent agent operations must use
+--agent <slug> or COGX_AGENT_SLUG so concurrent sessions cannot overwrite
+each other's identity.`,
+
+  "agent list": `cogx agent list [--json]
+
+List registered agents and synchronize the local identity catalog.`,
+
+  "agent status": `cogx agent status [--json]
+
+Show the current session-safe identity and all locally known agents.`,
+
+  "agent activate": `eval "$(cogx agent activate <slug>)"
+
+Print a shell export for COGX_AGENT_SLUG. Activation is shell-session local;
+it never mutates another terminal or agent session.`,
+
+  "agent inbox": `cogx agent inbox --agent <slug> [--limit N] [--json]
+
+Read direct and team messages for one agent.`,
+
+  "agent send": `cogx agent send <recipient> <message> --agent <sender> --context <why>
+
+Send an attributed agent message. Optional: --kind, --thread, --reply-to,
+--memory <id,id>.`,
+
+  "agent ack": `cogx agent ack <message-id> --agent <recipient>
+
+Acknowledge one inbox message for this recipient only.`,
+
+  "agent thread": `cogx agent thread <thread-id> --agent <participant>
+
+Inspect the complete shared orchestration thread.`,
+
+  "agent handoff": `cogx agent handoff <recipient> <task-summary> --agent <sender> --context <why>
+
+Transfer an active task with optional --memory <id,id> evidence.`,
+
+  "team list": `cogx team list [--json]
+
+List agent teams.`,
+
+  "team create": `cogx team create <name> --members a,b,c
+
+Create or replace an agent team.`,
+
+  "team set-members": `cogx team set-members <team-id> --members a,b,c
+
+Atomically replace a team's membership.`,
+
+  "team delete": `cogx team delete <team-id>
+
+Delete an agent team.`,
+
+  "orchestrate": `cogx orchestrate <goal> --agent <coordinator> --agents a,b,c
+
+Create one shared thread and dispatch work to multiple agents. Use --tasks
+'{"a":"task A","b":"task B"}' for per-agent assignments, or --team <name>
+to broadcast to a registered team.`,
 
   "doctor": `cogx doctor [--json]
 
@@ -1544,7 +1932,7 @@ function help(cmdKey) {
     console.log(HELP_BY_CMD[cmdKey]);
     return;
   }
-  console.log(`${c.bold("cogx")} ${c.dim("v" + VERSION)} — CogX CLI
+  console.log(`${c.bold("cogx")} ${c.dim("v" + VERSION)} — Persistent Memory Protocol CLI
 
 ${c.bold("Usage:")}  cogx <command> [args] [flags]
 
@@ -1563,6 +1951,14 @@ ${c.bold("Cognition:")}
   dream                      trigger dream consolidation
   dream-status               check dream job progress
   save-session <summary>     store an episodic session memory
+
+${c.bold("Multi-agent:")}
+  agent list | status        inspect identities without global switching
+  agent activate <slug>      print a shell-session identity export
+  agent inbox | send | ack   addressed agent messaging
+  agent handoff              transfer a task with memory references
+  team list | create         manage collaboration teams
+  orchestrate <goal>         dispatch one goal/thread to agents or a team
 
 ${c.bold("Setup:")}
   auth login                 sign in via browser device flow
@@ -1592,6 +1988,8 @@ ${c.bold("Global flags:")}
   --json, -j                 emit JSON output (machine-readable)
   --api-key KEY              one-off API key (overrides env + saved creds)
   --project, -p NAME         tag query/content with [Project: NAME]
+  --agent SLUG               attribute this command to one agent session
+  --as-user                  explicitly run without agent attribution
   --type, -t TYPE            memory type (semantic|episodic|procedural|foundational)
   --limit, -l N              limit results (recall, search)
   --help, -h                 show help (use 'cogx <cmd> --help' for command help)
@@ -1601,6 +1999,7 @@ ${c.bold("Env:")}
   ICOG_API_KEY               override stored credentials
   ICOG_API_URL               override API endpoint (default: ${API_URL})
   ICOG_PROJECT               default project tag
+  COGX_AGENT_SLUG            shell/session-scoped agent identity
   ICOG_TIMEOUT_MS            request timeout in ms (default: ${DEFAULT_TIMEOUT_MS})
   NO_COLOR=1                 disable color output
 
@@ -1643,6 +2042,28 @@ const COMMANDS = {
     },
     helpKey: (sub) => `billing ${sub}`,
   },
+  "agent": {
+    sub: {
+      "list":     cmdAgentList,
+      "status":   cmdAgentStatus,
+      "activate": cmdAgentActivate,
+      "inbox":    cmdAgentInbox,
+      "send":     cmdAgentSend,
+      "ack":      cmdAgentAck,
+      "thread":   cmdAgentThread,
+      "handoff":  cmdAgentHandoff,
+    },
+    helpKey: (sub) => `agent ${sub}`,
+  },
+  "team": {
+    sub: {
+      "list":        cmdTeamList,
+      "create":      cmdTeamCreate,
+      "set-members": cmdTeamSetMembers,
+      "delete":      cmdTeamDelete,
+    },
+    helpKey: (sub) => `team ${sub}`,
+  },
   "recall":       { fn: cmdRecall },
   "remember":     { fn: cmdRemember },
   "forget":       { fn: cmdForget },
@@ -1656,6 +2077,7 @@ const COMMANDS = {
   "dream-status": { fn: cmdDreamStatus },
   "save-session": { fn: cmdSaveSession },
   "identify":     { fn: cmdIdentify },
+  "orchestrate":  { fn: cmdOrchestrate },
   "search":       { fn: cmdSearch },
   "doctor":       { fn: cmdDoctor },
   "self-update":  { fn: cmdSelfUpdate },

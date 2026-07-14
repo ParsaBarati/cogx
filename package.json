@@ -1,7 +1,7 @@
 {
   "name": "@cognitivx/cli",
-  "version": "1.2.0",
-  "description": "CogX CLI — recall, remember, and talk to your personal AI from any terminal. Pure Node.js, zero dependencies.",
+  "version": "1.3.0",
+  "description": "CogX CLI for the Persistent Memory Protocol (PMP): durable AI identity, memory, and multi-agent orchestration.",
   "bin": {
     "cogx": "./index.js"
   },
@@ -23,6 +23,7 @@
     "memory",
     "ai",
     "mcp",
+    "pmp",
     "claude",
     "agent",
     "cli"

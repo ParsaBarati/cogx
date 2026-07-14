@@ -2,6 +2,21 @@
 
 All notable changes to `cogx` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [1.3.0] — 2026-07-14
+
+### Added
+- Named the durable identity, memory, provenance, and coordination contract the **Persistent Memory Protocol (PMP) 1.0**. CogX is its command-line client; PMP complements MCP's session-time tool access.
+- Session-safe agent identity via `--agent`, `COGX_AGENT_SLUG`, and `cogx agent activate`; multiple registered agents now fail closed instead of silently sharing one global identity.
+- Agent operations: `agent list`, `status`, `inbox`, `send`, `ack`, `thread`, and `handoff`.
+- Team operations: `team list`, `create`, `set-members`, and `delete`.
+- `cogx orchestrate` dispatches one shared goal/thread to multiple agents or a team, with optional per-agent task JSON.
+- `remember --share-with a,b` writes with agent attribution and explicitly shares the resulting memory.
+- `talk --task` and `--scope` expose iCog's current-task grounding and tiered/strict/lazy recall modes.
+
+### Fixed
+- `recall`, `remember`, `talk`, and `save-session` now send the selected `agent_slug`; v1.2.0 saved the slug but never used it.
+- `identify` now defaults to the canonical v14 `tool` policy type. Legacy backend role labels remain server-compatible.
+
 ## [1.2.0] — 2026-05-30
 
 ### Added
