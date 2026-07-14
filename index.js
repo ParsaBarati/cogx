@@ -6,18 +6,19 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const readline = require("readline");
-const { exec } = require("child_process");
+const { exec, spawn, spawnSync } = require("child_process");
 
 if (typeof fetch !== "function") {
   console.error("cogx requires Node.js 18 or newer (no built-in fetch found).");
   process.exit(1);
 }
 
-const VERSION = "1.3.1";
+const VERSION = "1.4.0";
 const API_URL = (process.env.ICOG_API_URL || "https://api.cognitivx.io").replace(/\/$/, "");
 const ICOG_DIR = path.join(os.homedir(), ".icog");
 const CREDS_PATH = path.join(ICOG_DIR, "credentials.json");
 const HISTORY_PATH = path.join(ICOG_DIR, "history");
+const NOTIFY_ROOT = path.join(ICOG_DIR, "notifications");
 const DEFAULT_TIMEOUT_MS = parseInt(process.env.ICOG_TIMEOUT_MS || "60000", 10);
 
 // ---------------------------------------------------------------------------
@@ -151,7 +152,7 @@ function parseArgs(argv) {
       if (eq >= 0) { flags[a.slice(2, eq)] = a.slice(eq + 1); continue; }
       const key = a.slice(2);
       const next = argv[i + 1];
-      if (["all", "as-user", "deep", "force", "help", "json", "version"].includes(key)) flags[key] = true;
+      if (["all", "as-user", "deep", "desktop", "force", "help", "json", "no-desktop", "no-preview", "notify", "preview", "replay", "version"].includes(key)) flags[key] = true;
       else if (next !== undefined && !next.startsWith("-")) { flags[key] = next; i++; }
       else flags[key] = true;
     } else if (a.startsWith("-") && a.length > 1) {
@@ -1186,7 +1187,399 @@ function numericFlag(flags, name, fallback, { min = 0 } = {}) {
   return value;
 }
 
-async function cmdAgentActivate(args) {
+function notifyPaths(slug) {
+  const dir = path.join(NOTIFY_ROOT, normalizeAgentSlug(slug));
+  return {
+    dir,
+    state: path.join(dir, "state.json"),
+    events: path.join(dir, "events.ndjson"),
+    daemon: path.join(dir, "daemon.log"),
+  };
+}
+
+function ensureNotifyDir(slug) {
+  const paths = notifyPaths(slug);
+  fs.mkdirSync(paths.dir, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(paths.dir, 0o700); } catch { /* Windows ignores POSIX modes. */ }
+  return paths;
+}
+
+function readNotifyState(slug) {
+  const paths = notifyPaths(slug);
+  try { return JSON.parse(fs.readFileSync(paths.state, "utf8")); }
+  catch { return null; }
+}
+
+function writeNotifyState(slug, state) {
+  const paths = ensureNotifyDir(slug);
+  const payload = JSON.stringify(state, null, 2);
+  const temp = `${paths.state}.${process.pid}.tmp`;
+  fs.writeFileSync(temp, payload, { mode: 0o600 });
+  try {
+    fs.renameSync(temp, paths.state);
+  } catch {
+    // Some Windows filesystems do not replace an existing file atomically.
+    fs.writeFileSync(paths.state, payload, { mode: 0o600 });
+    try { fs.rmSync(temp, { force: true }); } catch { /* best effort */ }
+  }
+  try { fs.chmodSync(paths.state, 0o600); } catch { /* Windows */ }
+}
+
+function processIsAlive(pid) {
+  if (!Number.isInteger(Number(pid)) || Number(pid) <= 0) return false;
+  try {
+    process.kill(Number(pid), 0);
+    return true;
+  } catch (error) {
+    return error && error.code === "EPERM";
+  }
+}
+
+function rotateNotifyLog(file, maxBytes = 5 * 1024 * 1024) {
+  try {
+    if (fs.statSync(file).size < maxBytes) return;
+    const previous = `${file}.1`;
+    fs.rmSync(previous, { force: true });
+    fs.renameSync(file, previous);
+  } catch { /* Missing or temporarily unavailable log: append will create it. */ }
+}
+
+function appendNotifyEvent(slug, event) {
+  const paths = ensureNotifyDir(slug);
+  rotateNotifyLog(paths.events);
+  fs.appendFileSync(paths.events, `${JSON.stringify(event)}\n`, { mode: 0o600 });
+  try { fs.chmodSync(paths.events, 0o600); } catch { /* Windows */ }
+}
+
+function notificationStateForOutput(slug, state = readNotifyState(slug)) {
+  if (!state) return { agent_slug: slug, configured: false, running: false };
+  let webhookOrigin = null;
+  if (state.webhook) {
+    try { webhookOrigin = new URL(state.webhook).origin; } catch { webhookOrigin = "configured"; }
+  }
+  return {
+    agent_slug: slug,
+    configured: true,
+    running: processIsAlive(state.pid),
+    pid: state.pid || null,
+    started_at: state.started_at || null,
+    stopped_at: state.stopped_at || null,
+    interval_seconds: state.interval_seconds,
+    desktop: !!state.desktop,
+    preview: !!state.preview,
+    webhook_configured: !!state.webhook,
+    webhook_origin: webhookOrigin,
+    seen_count: Array.isArray(state.seen_message_ids) ? state.seen_message_ids.length : 0,
+    last_poll_at: state.last_poll_at || null,
+    last_event_at: state.last_event_at || null,
+    last_sender: state.last_sender || null,
+    last_error: state.last_error || null,
+  };
+}
+
+function normalizeWebhookUrl(value) {
+  if (!value) return "";
+  if (value === true) die("--webhook requires an http(s) URL");
+  if (String(value).toLowerCase() === "none") return "";
+  let parsed;
+  try { parsed = new URL(String(value)); }
+  catch { die("--webhook must be a valid http(s) URL"); }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    die("--webhook must use http or https");
+  }
+  return parsed.toString();
+}
+
+function desktopNotification(slug, message, { enabled, preview }) {
+  if (!enabled) return { status: "disabled" };
+  const sender = message.sender_slug || "another agent";
+  const title = `CogX · ${slug}`;
+  const body = preview
+    ? `${sender}: ${String(message.content || "").slice(0, 240)}`
+    : `New ${message.message_kind || "message"} from ${sender}. Open the CogX inbox.`;
+  let result;
+  if (process.platform === "darwin") {
+    const script = `display notification ${JSON.stringify(body)} with title ${JSON.stringify(title)}`;
+    result = spawnSync("osascript", ["-e", script], { encoding: "utf8", timeout: 5000 });
+  } else if (process.platform === "linux") {
+    result = spawnSync("notify-send", ["--app-name", "CogX PMP", title, body], { encoding: "utf8", timeout: 5000 });
+  } else {
+    return { status: "unsupported", platform: process.platform };
+  }
+  if (result.error || result.status !== 0) {
+    return {
+      status: "failed",
+      error: result.error?.message || String(result.stderr || `exit ${result.status}`).trim(),
+    };
+  }
+  return { status: "delivered" };
+}
+
+async function webhookNotification(url, event) {
+  if (!url) return { status: "disabled" };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "User-Agent": `cogx/${VERSION}` },
+      body: JSON.stringify(event),
+      signal: controller.signal,
+    });
+    if (!response.ok) return { status: "failed", error: `HTTP ${response.status}` };
+    return { status: "delivered" };
+  } catch (error) {
+    return { status: "failed", error: error.message || String(error) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function stopNotificationSupervisor(slug) {
+  const state = readNotifyState(slug);
+  if (!state || !processIsAlive(state.pid)) {
+    if (state) writeNotifyState(slug, { ...state, pid: null, running: false, stopped_at: state.stopped_at || new Date().toISOString() });
+    return { stopped: false, already_stopped: true };
+  }
+  try { process.kill(Number(state.pid), "SIGTERM"); }
+  catch (error) {
+    if (error.code !== "ESRCH") throw error;
+  }
+  for (let i = 0; i < 20 && processIsAlive(state.pid); i++) await sleep(100);
+  if (processIsAlive(state.pid)) {
+    try { process.kill(Number(state.pid), "SIGKILL"); } catch { /* already exited */ }
+  }
+  const latest = readNotifyState(slug) || state;
+  writeNotifyState(slug, { ...latest, pid: null, running: false, stopped_at: new Date().toISOString() });
+  return { stopped: true, already_stopped: false };
+}
+
+async function startNotificationSupervisor(slug, flags = {}) {
+  await httpRequest("GET", `/api/agents/${encodeURIComponent(slug)}`);
+  const previous = readNotifyState(slug);
+  if (previous && processIsAlive(previous.pid)) {
+    if (!flags.force) return { started: false, already_running: true, state: notificationStateForOutput(slug, previous) };
+    await stopNotificationSupervisor(slug);
+  }
+
+  const intervalSeconds = numericFlag(flags, "interval", previous?.interval_seconds || 2, { min: 0.25 });
+  const webhook = flags.webhook !== undefined
+    ? normalizeWebhookUrl(flags.webhook)
+    : previous?.webhook || "";
+  const desktop = flags.desktop ? true : flags["no-desktop"] ? false : previous?.desktop !== false;
+  const preview = flags.preview ? true : flags["no-preview"] ? false : !!previous?.preview;
+  const paths = ensureNotifyDir(slug);
+  const state = {
+    version: 1,
+    agent_slug: slug,
+    pid: null,
+    running: false,
+    started_at: new Date().toISOString(),
+    stopped_at: null,
+    interval_seconds: intervalSeconds,
+    desktop,
+    preview,
+    webhook,
+    seen_message_ids: flags.replay ? [] : (previous?.seen_message_ids || []),
+    last_poll_at: previous?.last_poll_at || null,
+    last_event_at: previous?.last_event_at || null,
+    last_sender: previous?.last_sender || null,
+    last_error: null,
+  };
+  writeNotifyState(slug, state);
+
+  const daemonFd = fs.openSync(paths.daemon, "a", 0o600);
+  let child;
+  try {
+    child = spawn(process.execPath, [__filename, "agent", "notify", "__run", "--agent", slug], {
+      detached: true,
+      stdio: ["ignore", daemonFd, daemonFd],
+      env: { ...process.env, COGX_NOTIFY_DAEMON: "1" },
+      windowsHide: true,
+    });
+    child.unref();
+  } finally {
+    fs.closeSync(daemonFd);
+  }
+  const running = { ...state, pid: child.pid, running: true };
+  writeNotifyState(slug, running);
+  return { started: true, already_running: false, state: notificationStateForOutput(slug, running) };
+}
+
+async function runNotificationSupervisor(slug) {
+  if (process.env.COGX_NOTIFY_DAEMON !== "1") die("notification daemon is an internal command");
+  let state = readNotifyState(slug);
+  if (!state) throw new Error(`notification state missing for ${slug}`);
+  let stopping = false;
+  let wakeStop;
+  const stopSignal = new Promise((resolve) => { wakeStop = resolve; });
+  const requestStop = () => { stopping = true; wakeStop(); };
+  process.once("SIGTERM", requestStop);
+  process.once("SIGINT", requestStop);
+  state = { ...state, pid: process.pid, running: true, last_error: null };
+  writeNotifyState(slug, state);
+  let lastLoggedError = "";
+  let lastErrorAt = 0;
+
+  try {
+    while (!stopping) {
+      try {
+        state = readNotifyState(slug) || state;
+        const inbox = await fetchUnreadAgentInbox(slug);
+        const seen = new Set(state.seen_message_ids || []);
+        for (const message of unreadAgentMessages(inbox).slice().reverse()) {
+          if (seen.has(message.id)) continue;
+          const event = {
+            event: "pmp_message",
+            agent_slug: slug,
+            observed_at: new Date().toISOString(),
+            message,
+          };
+          event.delivery = {
+            desktop: desktopNotification(slug, message, { enabled: state.desktop, preview: state.preview }),
+            webhook: await webhookNotification(state.webhook, event),
+          };
+          appendNotifyEvent(slug, event);
+          seen.add(message.id);
+          state = {
+            ...state,
+            seen_message_ids: [...seen].slice(-2000),
+            last_event_at: event.observed_at,
+            last_sender: message.sender_slug || null,
+            last_error: [event.delivery.desktop, event.delivery.webhook]
+              .filter((result) => result.status === "failed")
+              .map((result) => result.error)
+              .join("; ") || null,
+          };
+          writeNotifyState(slug, state);
+        }
+        state = { ...state, last_poll_at: new Date().toISOString(), last_error: state.last_error || null };
+        writeNotifyState(slug, state);
+        lastLoggedError = "";
+      } catch (error) {
+        const message = error.message || String(error);
+        state = { ...state, last_poll_at: new Date().toISOString(), last_error: message };
+        writeNotifyState(slug, state);
+        if (message !== lastLoggedError || Date.now() - lastErrorAt > 60000) {
+          appendNotifyEvent(slug, { event: "poll_error", agent_slug: slug, observed_at: new Date().toISOString(), error: message });
+          lastLoggedError = message;
+          lastErrorAt = Date.now();
+        }
+      }
+      if (!stopping) await Promise.race([sleep(Number(state.interval_seconds || 2) * 1000), stopSignal]);
+    }
+  } finally {
+    state = readNotifyState(slug) || state;
+    writeNotifyState(slug, { ...state, pid: null, running: false, stopped_at: new Date().toISOString() });
+  }
+}
+
+async function cmdAgentNotify(args, flags) {
+  const action = String(args[0] || "status").toLowerCase();
+  const explicitSlug = normalizeAgentSlug(flags.agent || process.env.COGX_AGENT_SLUG || process.env.ICOG_AGENT_SLUG || "");
+
+  if (action === "__run") {
+    const slug = explicitSlug || resolveAgentSlug(flags, { required: true });
+    await runNotificationSupervisor(slug);
+    return;
+  }
+  if (action === "status" && !explicitSlug) {
+    let slugs = [];
+    try { slugs = fs.readdirSync(NOTIFY_ROOT, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort(); }
+    catch { /* no supervisors configured */ }
+    const supervisors = slugs.map((slug) => notificationStateForOutput(slug));
+    if (JSON_MODE) console.log(JSON.stringify({ ok: true, supervisors }));
+    else if (!supervisors.length) console.log(c.dim("No notification supervisors configured."));
+    else for (const item of supervisors) console.log(`${item.running ? c.green("●") : c.gray("○")} ${c.bold(item.agent_slug)} ${item.running ? `pid ${item.pid}` : "stopped"} ${c.dim(`${item.seen_count} observed`)}`);
+    return;
+  }
+
+  const slug = explicitSlug || resolveAgentSlug(flags, { required: true });
+  if (action === "start") {
+    const result = await startNotificationSupervisor(slug, flags);
+    out(
+      result.started
+        ? `${c.green("✓")} notification supervisor started for ${slug} (pid ${result.state.pid})`
+        : `${c.green("✓")} notification supervisor already running for ${slug} (pid ${result.state.pid})`,
+      { ok: true, ...result },
+    );
+    return;
+  }
+  if (action === "stop") {
+    const result = await stopNotificationSupervisor(slug);
+    out(
+      result.stopped ? `${c.green("✓")} notification supervisor stopped for ${slug}` : c.dim(`notification supervisor already stopped for ${slug}`),
+      { ok: true, agent_slug: slug, ...result },
+    );
+    return;
+  }
+  if (action === "status") {
+    const state = notificationStateForOutput(slug);
+    if (JSON_MODE) console.log(JSON.stringify({ ok: true, ...state }));
+    else {
+      console.log(`${state.running ? c.green("● running") : c.gray("○ stopped")} ${c.bold(slug)}${state.pid ? ` (pid ${state.pid})` : ""}`);
+      if (state.configured) {
+        console.log(c.dim(`  poll ${state.interval_seconds}s · desktop ${state.desktop ? "on" : "off"} · webhook ${state.webhook_configured ? state.webhook_origin : "off"}`));
+        console.log(c.dim(`  observed ${state.seen_count} · last poll ${state.last_poll_at || "never"} · last event ${state.last_event_at || "never"}`));
+        if (state.last_error) console.log(c.yellow(`  last error: ${state.last_error}`));
+      }
+    }
+    return;
+  }
+  if (action === "logs") {
+    const limit = Math.floor(numericFlag(flags, "limit", 20, { min: 1 }));
+    const paths = notifyPaths(slug);
+    let events = [];
+    try { events = fs.readFileSync(paths.events, "utf8").trim().split("\n").filter(Boolean).slice(-limit).map((line) => JSON.parse(line)); }
+    catch { /* no events yet */ }
+    if (JSON_MODE) console.log(JSON.stringify({ ok: true, agent_slug: slug, events }));
+    else if (!events.length) console.log(c.dim(`No notification events for ${slug}.`));
+    else for (const event of events) {
+      if (event.event === "pmp_message") printAgentMessage(event.message);
+      else console.log(c.yellow(`${event.observed_at} ${event.event}: ${event.error || ""}`));
+    }
+    return;
+  }
+  if (action === "test") {
+    const state = readNotifyState(slug);
+    if (!state) die(`notification supervisor is not configured for ${slug}; run: cogx agent notify start --agent ${slug}`);
+    const event = {
+      event: "pmp_notification_test",
+      agent_slug: slug,
+      observed_at: new Date().toISOString(),
+      message: {
+        id: "notification-test",
+        sender_slug: "cogx",
+        message_kind: "test",
+        delivery_status: "local-test",
+        content: "PMP notification test",
+        context_explanation: "Verify the local notification supervisor outputs.",
+      },
+    };
+    const delivery = {
+      desktop: desktopNotification(slug, event.message, { enabled: state.desktop, preview: state.preview }),
+      webhook: await webhookNotification(state.webhook, event),
+    };
+    appendNotifyEvent(slug, { ...event, delivery });
+    const failed = Object.values(delivery).filter((result) => result.status === "failed");
+    if (JSON_MODE) console.log(JSON.stringify({ ok: failed.length === 0, agent_slug: slug, delivery }));
+    else {
+      console.log(`${failed.length ? c.yellow("!") : c.green("✓")} notification test for ${slug}`);
+      console.log(c.dim(`  desktop ${delivery.desktop.status} · webhook ${delivery.webhook.status}`));
+      if (failed.length) process.exitCode = 1;
+    }
+    return;
+  }
+  if (action === "clear") {
+    const paths = ensureNotifyDir(slug);
+    fs.writeFileSync(paths.events, "", { mode: 0o600 });
+    out(`${c.green("✓")} notification event log cleared for ${slug}`, { ok: true, agent_slug: slug, cleared: true });
+    return;
+  }
+  die("usage: cogx agent notify <start|stop|status|logs|test|clear> --agent <slug>");
+}
+
+async function cmdAgentActivate(args, flags) {
   const slug = normalizeAgentSlug(args[0]);
   if (!slug) die("usage: cogx agent activate <slug>");
   await httpRequest("GET", `/api/agents/${encodeURIComponent(slug)}`);
@@ -1198,6 +1591,8 @@ async function cmdAgentActivate(args) {
   } catch {
     inboxAvailable = false;
   }
+  let notifications = null;
+  if (flags.notify) notifications = await startNotificationSupervisor(slug, flags);
   if (JSON_MODE) {
     console.log(JSON.stringify({
       ok: true,
@@ -1205,6 +1600,7 @@ async function cmdAgentActivate(args) {
       shell: `export COGX_AGENT_SLUG=${slug}`,
       unread_count: unreadCount,
       inbox_available: inboxAvailable,
+      notifications: notifications?.state || null,
     }));
     return;
   }
@@ -1215,6 +1611,9 @@ async function cmdAgentActivate(args) {
     console.error(c.yellow(`warning: activated ${slug}, but the inbox check was unavailable`));
   } else if (unreadCount > 0) {
     console.error(c.yellow(`⚑ ${slug} has ${unreadCount} unread message${unreadCount === 1 ? "" : "s"}. Run: cogx agent inbox --agent ${slug}`));
+  }
+  if (notifications) {
+    console.error(c.green(`✓ notifications ${notifications.started ? "started" : "already running"} for ${slug} (pid ${notifications.state.pid})`));
   }
 }
 
@@ -1976,10 +2375,11 @@ List registered agents and synchronize the local identity catalog.`,
 
 Show the current session-safe identity and all locally known agents.`,
 
-  "agent activate": `eval "$(cogx agent activate <slug>)"
+  "agent activate": `eval "$(cogx agent activate <slug> [--notify])"
 
 Print a shell export for COGX_AGENT_SLUG. Activation is shell-session local;
-it never mutates another terminal or agent session.`,
+it never mutates another terminal or agent session. --notify also starts the
+background notification supervisor for this identity.`,
 
   "agent inbox": `cogx agent inbox --agent <slug> [--limit N] [--json]
 
@@ -1994,6 +2394,24 @@ Use --timeout 0 to wait indefinitely. A timeout exits with status 2.`,
 
 Continuously print newly observed unread messages without acknowledging them.
 Defaults to a 2-second poll interval and no timeout. JSON output is NDJSON.`,
+
+  "agent notify": `cogx agent notify <start|stop|status|logs|test|clear> --agent <slug> [options]
+
+Manage a detached PMP notification supervisor that survives the invoking shell.
+
+Start options:
+  --interval SECONDS   poll interval (default 2, minimum 0.25)
+  --desktop            enable desktop notifications
+  --no-desktop         disable desktop notifications
+  --preview            include message content in desktop notifications
+  --no-preview         hide message content (default)
+  --webhook URL|none   POST message events to a wake integration
+  --replay             notify existing unread messages again
+  --force              restart an already-running supervisor
+
+Logs are private NDJSON under ~/.icog/notifications/<slug>/. Notification
+delivery never acknowledges PMP receipts. Use "notify test" to verify the
+configured desktop and webhook outputs without creating a PMP message.`,
 
   "agent send": `cogx agent send <recipient> <message> --agent <sender> --context <why>
 
@@ -2118,8 +2536,9 @@ ${c.bold("Cognition:")}
 
 ${c.bold("Multi-agent:")}
   agent list | status        inspect identities without global switching
-  agent activate <slug>      print a shell-session identity export
+  agent activate <slug>      select identity; --notify starts its supervisor
   agent inbox | wait | watch addressed agent messaging + notifications
+  agent notify               background desktop/webhook notification manager
   agent handoff              transfer a task with memory references
   team list | create         manage collaboration teams
   orchestrate <goal>         dispatch one goal/thread to agents or a team
@@ -2214,6 +2633,7 @@ const COMMANDS = {
       "inbox":    cmdAgentInbox,
       "wait":     cmdAgentWait,
       "watch":    cmdAgentWatch,
+      "notify":   cmdAgentNotify,
       "send":     cmdAgentSend,
       "ack":      cmdAgentAck,
       "thread":   cmdAgentThread,

@@ -2,6 +2,20 @@
 
 All notable changes to `cogx` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [1.4.0] — 2026-07-14
+
+### Added
+- `cogx agent notify start|stop|status|logs|test|clear` manages a detached, per-agent notification supervisor with private state and bounded NDJSON event logs under `~/.icog/notifications/`.
+- `cogx agent notify test` verifies configured desktop and webhook delivery without creating or acknowledging a PMP message.
+- Native desktop notifications on macOS and Linux, private by default; `--preview` explicitly opts into message-content previews.
+- Optional `--webhook <url>` delivery sends full PMP message events to a host-runtime wake integration without forwarding CognitiveX credentials.
+- `cogx agent activate <slug> --notify` selects the session identity and idempotently starts its supervisor while preserving eval-safe stdout.
+- Restart-safe message deduplication, configurable polling, daemon health/status, replay, webhook disable, and forced restart controls.
+
+### Security
+- Notification directories and state/event files use owner-only permissions where supported.
+- Webhook URLs are never printed in full, and desktop notifications hide message content unless `--preview` is selected.
+
 ## [1.3.1] — 2026-07-14
 
 ### Added

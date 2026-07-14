@@ -60,6 +60,10 @@ function requests() {
   return fs.readFileSync(fixtureLog, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse);
 }
 
+function pause(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -313,6 +317,76 @@ test("agent wait times out with status 2 after message acknowledgement", () => {
   assert("wait timeout status", r.status === 2, `status=${r.status} stdout=${r.stdout} stderr=${r.stderr}`);
   const parsed = JSON.parse(r.stdout.trim());
   assert("wait timeout event", parsed.event === "timeout" && parsed.timed_out === true, r.stdout);
+});
+
+test("agent notification supervisor delivers, persists dedup state, and stops", () => {
+  const identified = run(["identify", "NotifyBot", "--json"]);
+  assert("notify agent identified", identified.status === 0, identified.stderr || identified.stdout);
+  const sent = run([
+    "agent", "send", "NotifyBot", "Wake the integration supervisor",
+    "--agent", "Abarcode", "--context", "background notification test", "--json",
+  ]);
+  assert("notify message sent", sent.status === 0, sent.stderr || sent.stdout);
+  const messageId = JSON.parse(sent.stdout.trim()).message.id;
+
+  const started = run([
+    "agent", "notify", "start", "--agent", "NotifyBot",
+    "--no-desktop", "--interval", "0.25",
+    "--webhook", `http://127.0.0.1:${fixturePort}/notify-hook`, "--json",
+  ]);
+  assert("notify start status", started.status === 0, started.stderr || started.stdout);
+  const startPayload = JSON.parse(started.stdout.trim());
+  assert("notify supervisor started", startPayload.started === true && startPayload.state.running === true, started.stdout);
+
+  pause(700);
+  const status = run(["agent", "notify", "status", "--agent", "NotifyBot", "--json"]);
+  const statusPayload = JSON.parse(status.stdout.trim());
+  assert("notify status running", status.status === 0 && statusPayload.running === true, status.stdout);
+  assert("notify status observed", statusPayload.seen_count === 1, status.stdout);
+  assert("notify webhook configured", statusPayload.webhook_configured === true, status.stdout);
+
+  const logs = run(["agent", "notify", "logs", "--agent", "NotifyBot", "--json"]);
+  const logPayload = JSON.parse(logs.stdout.trim());
+  const messageEvents = logPayload.events.filter((event) => event.event === "pmp_message");
+  assert("notify log has event", messageEvents.length === 1, logs.stdout);
+  assert("notify event message id", messageEvents[0].message.id === messageId, logs.stdout);
+  assert("notify webhook delivered", messageEvents[0].delivery.webhook.status === "delivered", logs.stdout);
+  const hooks = requests().filter((request) => request.path === "/notify-hook");
+  assert("notify webhook called once", hooks.length === 1, JSON.stringify(hooks));
+  assert("notify webhook payload", hooks[0].body.message.id === messageId, JSON.stringify(hooks[0]));
+
+  const tested = run(["agent", "notify", "test", "--agent", "NotifyBot", "--json"]);
+  const testPayload = JSON.parse(tested.stdout.trim());
+  assert("notify test status", tested.status === 0 && testPayload.ok === true, tested.stderr || tested.stdout);
+  assert("notify test webhook delivered", testPayload.delivery.webhook.status === "delivered", tested.stdout);
+  const hooksAfterTest = requests().filter((request) => request.path === "/notify-hook");
+  assert("notify test calls webhook", hooksAfterTest.length === 2, JSON.stringify(hooksAfterTest));
+  assert("notify test payload type", hooksAfterTest[1].body.event === "pmp_notification_test", JSON.stringify(hooksAfterTest[1]));
+
+  const stopped = run(["agent", "notify", "stop", "--agent", "NotifyBot", "--json"]);
+  assert("notify stop status", stopped.status === 0 && JSON.parse(stopped.stdout.trim()).stopped === true, stopped.stdout);
+
+  const restarted = run([
+    "agent", "notify", "start", "--agent", "NotifyBot",
+    "--no-desktop", "--interval", "0.25", "--webhook", "none", "--json",
+  ]);
+  assert("notify restart status", restarted.status === 0, restarted.stderr || restarted.stdout);
+  pause(500);
+  const logsAfterRestart = JSON.parse(run(["agent", "notify", "logs", "--agent", "NotifyBot", "--json"]).stdout.trim());
+  assert("notify restart deduplicates", logsAfterRestart.events.filter((event) => event.event === "pmp_message").length === 1, JSON.stringify(logsAfterRestart));
+  const stopAgain = run(["agent", "notify", "stop", "--agent", "NotifyBot", "--json"]);
+  assert("notify second stop", stopAgain.status === 0, stopAgain.stderr || stopAgain.stdout);
+});
+
+test("agent activate --notify is eval-safe and manages the supervisor", () => {
+  const activated = run(["agent", "activate", "Aporta", "--notify", "--no-desktop", "--interval", "0.25"]);
+  assert("activate notify status", activated.status === 0, activated.stderr);
+  assert("activate notify export only", activated.stdout.trim() === "export COGX_AGENT_SLUG=aporta", activated.stdout);
+  assert("activate notify started", /notifications (started|already running)/.test(activated.stderr), activated.stderr);
+  const status = JSON.parse(run(["agent", "notify", "status", "--agent", "Aporta", "--json"]).stdout.trim());
+  assert("activate notify running", status.running === true, JSON.stringify(status));
+  const stopped = run(["agent", "notify", "stop", "--agent", "Aporta", "--json"]);
+  assert("activate notify stopped", stopped.status === 0, stopped.stderr || stopped.stdout);
 });
 
 // ---------------------------------------------------------------------------

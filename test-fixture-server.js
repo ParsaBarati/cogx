@@ -87,6 +87,9 @@ http.createServer((req, res) => {
     if (req.method === "POST" && url.pathname === "/api/consciousness/talk") {
       return send(res, 200, { response: "ok", context_used: 0 });
     }
+    if (req.method === "POST" && url.pathname === "/notify-hook") {
+      return send(res, 200, { received: true });
+    }
     if (req.method === "GET" && url.pathname === "/api/teams") return send(res, 200, teams);
     if (req.method === "POST" && url.pathname === "/api/teams") {
       const team = { id: randomUUID(), name: body.name, owner_user_id: "test", member_slugs: body.member_slugs, created_at: new Date().toISOString(), updated_at: new Date().toISOString() };

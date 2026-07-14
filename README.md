@@ -155,16 +155,40 @@ cogx remember "Barcode owns invoice authority" --agent Abarcode \
 cogx talk "check this boundary" --agent Automa --task "mapping integrations" --scope strict
 ```
 
-Or activate it only in the current shell—never globally across sessions:
+Or activate it only in the current shell and start its background notification
+supervisor in one command:
 
 ```bash
-eval "$(cogx agent activate Aporta)"
+eval "$(cogx agent activate Aporta --notify)"
 cogx agent status
+cogx agent notify status --agent Aporta
 ```
 
 Activation checks the selected agent's inbox and prints any unread notice to
-stderr, keeping stdout safe for `eval`. To block until work arrives or keep a
-terminal watcher running:
+stderr, keeping stdout safe for `eval`. `--notify` starts a detached supervisor
+that survives the invoking shell and deduplicates notifications across restarts.
+
+Manage it explicitly when needed:
+
+```bash
+cogx agent notify start --agent Aporta
+cogx agent notify status --agent Aporta
+cogx agent notify test --agent Aporta
+cogx agent notify logs --agent Aporta --limit 20
+cogx agent notify stop --agent Aporta
+```
+
+Desktop notifications are enabled on macOS and Linux but hide message content
+by default. Add `--preview` to show content, `--no-desktop` for headless hosts,
+or a webhook to connect PMP to a host-runtime wake mechanism:
+
+```bash
+cogx agent notify start --agent Aporta --preview
+cogx agent notify start --agent Aporta --no-desktop \
+  --webhook https://runner.example/hooks/pmp
+```
+
+For foreground scripts, block until work arrives or stream NDJSON directly:
 
 ```bash
 cogx agent wait --agent Aporta                 # waits up to 5 minutes
@@ -174,7 +198,7 @@ cogx agent watch --agent Aporta --json         # NDJSON for a supervisor
 ```
 
 Watching does not acknowledge messages; receipt state changes only through
-`cogx agent ack`.
+`cogx agent ack`. The background supervisor follows the same rule.
 
 Coordinate through addressed messages and durable handoffs:
 
