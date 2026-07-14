@@ -9,13 +9,26 @@ const fs = require("fs");
 const CLI = path.join(__dirname, "index.js");
 const fixtureHome = fs.mkdtempSync(require("os").tmpdir() + "/cogx-fixture-");
 const fixtureLog = path.join(fixtureHome, "requests.jsonl");
+const fixtureReady = path.join(fixtureHome, "ready");
 fs.writeFileSync(fixtureLog, "");
 const fixturePort = 40000 + (process.pid % 20000);
 const fixtureServer = spawn(process.execPath, [path.join(__dirname, "test-fixture-server.js")], {
-  env: { ...process.env, COGX_TEST_PORT: String(fixturePort), COGX_TEST_LOG: fixtureLog },
+  env: {
+    ...process.env,
+    COGX_TEST_PORT: String(fixturePort),
+    COGX_TEST_LOG: fixtureLog,
+    COGX_TEST_READY: fixtureReady,
+  },
   stdio: "ignore",
 });
-Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+const fixtureDeadline = Date.now() + 20_000;
+while (!fs.existsSync(fixtureReady) && Date.now() < fixtureDeadline) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+}
+if (!fs.existsSync(fixtureReady)) {
+  fixtureServer.kill();
+  throw new Error("fixture server did not become ready within 20 seconds");
+}
 const env = {
   ...process.env,
   NO_COLOR: "1",

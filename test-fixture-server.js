@@ -6,6 +6,7 @@ const { randomUUID } = require("crypto");
 
 const port = Number(process.env.COGX_TEST_PORT);
 const logPath = process.env.COGX_TEST_LOG;
+const readyPath = process.env.COGX_TEST_READY;
 const agents = new Map();
 const teams = [];
 const messages = [];
@@ -134,4 +135,6 @@ http.createServer((req, res) => {
     }
     return send(res, 404, { detail: `${req.method} ${url.pathname} not mocked` });
   });
-}).listen(port, "127.0.0.1");
+}).listen(port, "127.0.0.1", () => {
+  if (readyPath) fs.writeFileSync(readyPath, String(process.pid));
+});

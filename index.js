@@ -1562,11 +1562,11 @@ async function cmdAgentNotify(args, flags) {
     };
     appendNotifyEvent(slug, { ...event, delivery });
     const failed = Object.values(delivery).filter((result) => result.status === "failed");
+    if (failed.length) process.exitCode = 1;
     if (JSON_MODE) console.log(JSON.stringify({ ok: failed.length === 0, agent_slug: slug, delivery }));
     else {
       console.log(`${failed.length ? c.yellow("!") : c.green("✓")} notification test for ${slug}`);
       console.log(c.dim(`  desktop ${delivery.desktop.status} · webhook ${delivery.webhook.status}`));
-      if (failed.length) process.exitCode = 1;
     }
     return;
   }
